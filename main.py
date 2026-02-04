@@ -6,9 +6,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 
 DATA_DIR = Path("data")
@@ -98,6 +105,25 @@ def render_plan(day: str, day_obj: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_start_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [["📌 План на сегодня"], ["🌙 Итог дня"]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def build_today_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Сделал 1", callback_data="done:1")],
+            [InlineKeyboardButton("✅ Сделал 2", callback_data="done:2")],
+            [InlineKeyboardButton("✅ Сделал 3", callback_data="done:3")],
+            [InlineKeyboardButton("🌙 Итог дня", callback_data="evening")],
+        ]
+    )
+
+
 def find_task(day_obj: Dict[str, Any], task_id: int) -> Optional[Dict[str, Any]]:
     for t in day_obj.get("tasks", []):
         if t.get("id") == task_id:
@@ -133,84 +159,23 @@ def ensure_min_tasks(day_obj: Dict[str, Any], min_count: int = 3) -> None:
     day_obj["tasks"] = normalize_task_ids(tasks)
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Привет! Я твой PM-бот (MVP v0.1).\n\n"
-        "Мини-ритуал:\n"
-        "1) /today — план на сегодня\n"
-        "2) /done 2 — отметить выполнение\n"
-        "3) /evening — итог дня и перенос\n\n"
-        "Контент учёбы остаётся в Notion, а я управляю задачами и фиксирую прогресс."
-    )
-
-
-async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    state = load_user_state(user_id)
-
-    day = today_str()
-    day_obj = get_day(state, day)
-
+def apply_done(day_obj: Dict[str, Any], task_id: int) -> tuple[bool, str]:
     if day_obj.get("closed"):
-        # если вдруг закрыто — создадим новый день заново (редко)
-        day_obj = {"tasks": [], "closed": False, "created_at": now_iso()}
-        state["days"][day] = day_obj
-
-    if not day_obj.get("tasks"):
-        create_default_plan(day_obj)
-
-    save_user_state(user_id, state)
-    await update.message.reply_text(render_plan(day, day_obj), parse_mode=ParseMode.HTML)
-
-
-async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    state = load_user_state(user_id)
-
-    day = today_str()
-    day_obj = get_day(state, day)
-
-    if day_obj.get("closed"):
-        await update.message.reply_text("Сегодняшний день уже закрыт. Напиши /today чтобы начать новый план.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Нужно указать номер задачи. Пример: /done 2")
-        return
-
-    try:
-        task_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Номер должен быть числом. Пример: /done 2")
-        return
+        return False, "Сегодняшний день уже закрыт. Напиши /today чтобы начать новый план."
 
     task = find_task(day_obj, task_id)
     if not task:
-        await update.message.reply_text(f"Не нашёл задачу с номером {task_id}. Сначала посмотри /today")
-        return
+        return False, f"Не нашёл задачу с номером {task_id}. Сначала посмотри /today"
 
     if task["status"] == "done":
-        await update.message.reply_text(f"Задача {task_id} уже была отмечена ✅")
-        return
+        return False, f"Задача {task_id} уже была отмечена ✅"
 
     task["status"] = "done"
     task["done_at"] = now_iso()
-
-    save_user_state(user_id, state)
-    await update.message.reply_text(f"✅ Отметил: {task_id}) {task['text']}")
+    return True, f"✅ Отметил: {task_id}) {task['text']}"
 
 
-async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    state = load_user_state(user_id)
-
-    day = today_str()
-    day_obj = get_day(state, day)
-
-    if day_obj.get("closed"):
-        await update.message.reply_text("День уже закрыт. Напиши /today чтобы увидеть план на сегодня.")
-        return
-
+def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any]) -> str:
     tasks: List[Dict[str, Any]] = day_obj.get("tasks", [])
     if not tasks:
         create_default_plan(day_obj)
@@ -254,8 +219,6 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     tomorrow_obj["tasks"] = normalize_task_ids(tomorrow_obj["tasks"])
     ensure_min_tasks(tomorrow_obj, min_count=3)
 
-    save_user_state(user_id, state)
-
     # Ответ
     lines = [
         f"🌙 <b>Итог дня {day}</b>",
@@ -279,7 +242,147 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for t in tomorrow_obj["tasks"]:
         lines.append(f"⬜ <b>{t['id']})</b> {t['text']}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    return "\n".join(lines)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Привет! Я твой PM-бот (MVP v0.1).\n\n"
+        "Как пользуемся:\n"
+        "1) С утра собери план на день\n"
+        "2) В течение дня отмечай выполненное\n"
+        "3) Вечером подведём итог и перенесём остаток\n\n"
+        "Жми кнопки ниже — это самый быстрый путь.",
+        reply_markup=build_start_keyboard(),
+    )
+
+
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    state = load_user_state(user_id)
+
+    day = today_str()
+    day_obj = get_day(state, day)
+
+    if day_obj.get("closed"):
+        # если вдруг закрыто — создадим новый день заново (редко)
+        day_obj = {"tasks": [], "closed": False, "created_at": now_iso()}
+        state["days"][day] = day_obj
+
+    if not day_obj.get("tasks"):
+        create_default_plan(day_obj)
+
+    save_user_state(user_id, state)
+    await update.message.reply_text(
+        render_plan(day, day_obj),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_today_keyboard(),
+    )
+
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    state = load_user_state(user_id)
+
+    day = today_str()
+    day_obj = get_day(state, day)
+
+    if day_obj.get("closed"):
+        await update.message.reply_text("Сегодняшний день уже закрыт. Напиши /today чтобы начать новый план.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Нужно указать номер задачи. Пример: /done 2")
+        return
+
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Номер должен быть числом. Пример: /done 2")
+        return
+
+    ok, message = apply_done(day_obj, task_id)
+    if not ok:
+        await update.message.reply_text(message)
+        return
+
+    save_user_state(user_id, state)
+    await update.message.reply_text(message)
+
+
+async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    state = load_user_state(user_id)
+
+    day = today_str()
+    day_obj = get_day(state, day)
+
+    if day_obj.get("closed"):
+        await update.message.reply_text("День уже закрыт. Напиши /today чтобы увидеть план на сегодня.")
+        return
+
+    report = build_evening_report(state, day, day_obj)
+    save_user_state(user_id, state)
+    await update.message.reply_text(report, parse_mode=ParseMode.HTML)
+
+
+async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    text = (update.message.text or "").strip()
+    if text == "📌 План на сегодня":
+        await cmd_today(update, context)
+    elif text == "🌙 Итог дня":
+        await cmd_evening(update, context)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+
+    data = query.data or ""
+    if data.startswith("done:"):
+        try:
+            task_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("Неверный номер задачи.", show_alert=True)
+            return
+
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        day = today_str()
+        day_obj = get_day(state, day)
+
+        ok, message = apply_done(day_obj, task_id)
+        if not ok:
+            await query.answer(message, show_alert=True)
+            return
+
+        save_user_state(user_id, state)
+        await query.edit_message_text(
+            render_plan(day, day_obj),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_today_keyboard(),
+        )
+        await query.answer(message)
+        return
+
+    if data == "evening":
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        day = today_str()
+        day_obj = get_day(state, day)
+
+        if day_obj.get("closed"):
+            await query.answer("День уже закрыт. Напиши /today чтобы увидеть план на сегодня.", show_alert=True)
+            await query.message.reply_text("День уже закрыт. Напиши /today чтобы увидеть план на сегодня.")
+            return
+
+        report = build_evening_report(state, day, day_obj)
+        save_user_state(user_id, state)
+        await query.message.reply_text(report, parse_mode=ParseMode.HTML)
+        await query.answer()
 
 
 def main() -> None:
@@ -299,6 +402,8 @@ def main() -> None:
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("evening", cmd_evening))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
 
     print("Bot is running... Press Ctrl+C to stop.")
     app.run_polling(close_loop=False)
