@@ -150,15 +150,13 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
 def build_today_keyboard(day_obj: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows = []
     tasks = day_obj.get("tasks", [])
-    shown = 0
-    for t in tasks:
-        if t.get("status") == "done":
-            continue
+    todo_tasks = [t for t in tasks if t.get("status") != "done"]
+    for t in todo_tasks[:10]:
         task_id = t.get("id")
-        rows.append([InlineKeyboardButton(f"✅ Сделал {task_id}", callback_data=f"done:{task_id}")])
-        shown += 1
-        if shown >= 10:
-            break
+        label = f"✅ {shorten_text(str(t.get('text', '')), 34)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"done:{task_id}")])
+    if len(todo_tasks) > 10:
+        rows.append([InlineKeyboardButton("…ещё", callback_data="noop")])
     rows.append([InlineKeyboardButton("🌙 Итог дня", callback_data="evening")])
     return InlineKeyboardMarkup(rows)
 
@@ -174,6 +172,16 @@ def build_add_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Выбрать дату", callback_data="add:date"),
                 InlineKeyboardButton("В бэклог", callback_data="add:backlog"),
             ],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+    )
+
+
+def build_add_today_closed_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Завтра", callback_data="add:tomorrow")],
+            [InlineKeyboardButton("Открыть новый день", callback_data="add:reopen_today")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
         ]
     )
@@ -347,7 +355,7 @@ def render_backlog_tail(backlog: List[Dict[str, Any]], limit: int = 3) -> str:
     return "\n".join(lines)
 
 
-def shorten_text(text: str, max_len: int = 28) -> str:
+def shorten_text(text: str, max_len: int = 32) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 1].rstrip() + "…"
@@ -369,7 +377,7 @@ def build_backlog_pick_keyboard(backlog: List[Dict[str, Any]], limit: int = 10) 
     items = backlog[-limit:]
     for item in items:
         item_id = item.get("id")
-        label = f"№{item_id} {shorten_text(str(item.get('text', '')))}"
+        label = f"№{item_id} {shorten_text(str(item.get('text', '')), 28)}"
         rows.append([InlineKeyboardButton(label, callback_data=f"pick:{item_id}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pick:back")])
     rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
@@ -391,6 +399,24 @@ def build_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
 
 
+def build_date_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Ввести дату", callback_data="date:input")],
+            [InlineKeyboardButton("Показать даты с задачами", callback_data="date:list")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+    )
+
+
+def build_date_list_keyboard(dates: List[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for iso in dates:
+        rows.append([InlineKeyboardButton(format_date_ru(iso), callback_data=f"date:open:{iso}")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("del_mode", None)
     context.user_data.pop("awaiting_del_id", None)
@@ -399,27 +425,27 @@ def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("move_mode", None)
     context.user_data.pop("move_task_id", None)
     context.user_data.pop("view_date_mode", None)
+    context.user_data.pop("pending_add_text", None)
 
 
 def render_day_preview(
-    day: str, day_obj: Dict[str, Any], limit: int = 3, include_text: Optional[str] = None
+    day: str, day_obj: Dict[str, Any], limit: int = 5, include_text: Optional[str] = None
 ) -> str:
     tasks: List[Dict[str, Any]] = day_obj.get("tasks", [])
     if not tasks:
         return f"План на {format_date_ru(day)} пока пуст."
 
     preview = tasks[:limit]
+    extra = None
     if include_text and all(t.get("text") != include_text for t in preview):
         extra = next((t for t in tasks if t.get("text") == include_text), None)
-        if extra:
-            if len(preview) >= limit:
-                preview = preview[: max(limit - 1, 0)] + [extra]
-            else:
-                preview = preview + [extra]
 
-    lines = [f"Превью задач на {format_date_ru(day)}:"]
+    lines = [f"Превью задач на {format_date_ru(day)} (всего: {len(tasks)}):"]
     for t in preview:
         lines.append(f"{t.get('id')}) {t.get('text')}")
+    if extra:
+        lines.append("…")
+        lines.append(f"{extra.get('id')}) {extra.get('text')}")
     return "\n".join(lines)
 
 
@@ -591,13 +617,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     day_obj = get_day(state, day)
     context.user_data["view_scope"] = "day"
     context.user_data["view_day"] = day
-
-    if day_obj.get("closed"):
-        # если вдруг закрыто — создадим новый день заново (редко)
-        day_obj = {"tasks": [], "closed": False, "created_at": now_iso()}
-        state["days"][day] = day_obj
-
-    if not day_obj.get("tasks"):
+    if not day_obj.get("closed") and not day_obj.get("tasks"):
         create_default_plan(day_obj)
 
     save_user_state(user_id, state)
@@ -697,11 +717,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await cmd_today(update, context)
             return
         if text == "📅 План по дате":
-            context.user_data["view_date_mode"] = True
-            await update.message.reply_text(
-                "Введи дату в формате ДД.ММ.ГГГГ",
-                reply_markup=build_cancel_keyboard(),
-            )
+            await update.message.reply_text("Выбери режим:", reply_markup=build_date_mode_keyboard())
             return
         if text == "➕ Добавить задачу":
             await cmd_add(update, context)
@@ -745,7 +761,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         iso_date = parse_date_input(text)
         if not iso_date:
             await update.message.reply_text(
-                "Введи дату в формате ДД.ММ.ГГГГ",
+                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
                 reply_markup=build_cancel_keyboard(),
             )
             return
@@ -883,6 +899,35 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         state = load_user_state(user_id)
         if add_mode == "today":
             day = today_str()
+            day_obj = get_day(state, day)
+            if day_obj.get("closed"):
+                context.user_data["pending_add_text"] = text
+                context.user_data.pop("add_mode", None)
+                context.user_data.pop("add_date", None)
+                await update.message.reply_text(
+                    "Сегодня уже закрыто. Куда добавить задачу?",
+                    reply_markup=build_add_today_closed_keyboard(),
+                )
+                return
+
+            day_obj = add_task_to_day(state, day, text)
+            save_user_state(user_id, state)
+            context.user_data.pop("add_mode", None)
+            context.user_data.pop("add_date", None)
+            context.user_data.pop("pending_add_text", None)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
+            await update.message.reply_text(
+                render_plan(day, day_obj),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_today_keyboard(day_obj),
+            )
+            return
+        if add_mode == "reopen_today":
+            day = today_str()
+            day_obj = {"tasks": [], "closed": False, "created_at": now_iso()}
+            state.setdefault("days", {})[day] = day_obj
+            create_default_plan(day_obj)
             day_obj = add_task_to_day(state, day, text)
             save_user_state(user_id, state)
             context.user_data.pop("add_mode", None)
@@ -986,6 +1031,63 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         await query.message.reply_text("Ок, отменил.", reply_markup=build_start_keyboard())
         return
+    if data == "noop":
+        await query.answer("Показаны первые 10 задач.", show_alert=True)
+        return
+
+    if data.startswith("date:"):
+        parts = data.split(":")
+        if len(parts) == 2 and parts[1] == "input":
+            reset_input_modes(context)
+            context.user_data["view_date_mode"] = True
+            await query.answer()
+            await query.message.reply_text(
+                "Введи дату в формате ДД.ММ.ГГГГ",
+                reply_markup=build_cancel_keyboard(),
+            )
+            return
+        if len(parts) == 2 and parts[1] == "list":
+            user_id = query.from_user.id
+            state = load_user_state(user_id)
+            days = state.get("days", {})
+            dates = []
+            for day_key, day_obj in days.items():
+                tasks = day_obj.get("tasks", [])
+                if tasks:
+                    dates.append(day_key)
+            dates = sorted(dates)[:10]
+            await query.answer()
+            if not dates:
+                await query.message.reply_text("Нет дат с задачами.", reply_markup=build_cancel_keyboard())
+                return
+            lines = ["Даты с задачами:"]
+            for iso in dates:
+                count = len(days.get(iso, {}).get("tasks", []))
+                lines.append(f"{format_date_ru(iso)} — {count} задач")
+            await query.message.reply_text(
+                "\n".join(lines),
+                reply_markup=build_date_list_keyboard(dates),
+            )
+            return
+        if len(parts) == 3 and parts[1] == "open":
+            iso = parts[2]
+            user_id = query.from_user.id
+            state = load_user_state(user_id)
+            day_obj = get_day(state, iso)
+            save_user_state(user_id, state)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = iso
+            await query.answer()
+            if iso == today_str() and not day_obj.get("closed"):
+                await query.message.reply_text(
+                    render_plan(iso, day_obj),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_today_keyboard(day_obj),
+                )
+            else:
+                await query.message.reply_text(render_plan(iso, day_obj), parse_mode=ParseMode.HTML)
+            return
+
 
     if data.startswith("done:"):
         try:
@@ -1017,8 +1119,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data.startswith("add:"):
         mode = data.split(":", 1)[1]
-        if mode not in {"today", "tomorrow", "date", "backlog"}:
+        if mode not in {"today", "tomorrow", "date", "backlog", "reopen_today"}:
             await query.answer("Неверный режим.", show_alert=True)
+            return
+
+        pending_text = context.user_data.pop("pending_add_text", None)
+
+        if mode in {"tomorrow", "reopen_today"} and pending_text:
+            user_id = query.from_user.id
+            state = load_user_state(user_id)
+            if mode == "reopen_today":
+                day = today_str()
+                day_obj = {"tasks": [], "closed": False, "created_at": now_iso()}
+                state.setdefault("days", {})[day] = day_obj
+                create_default_plan(day_obj)
+                day_obj = add_task_to_day(state, day, pending_text)
+                save_user_state(user_id, state)
+                context.user_data["view_scope"] = "day"
+                context.user_data["view_day"] = day
+                await query.answer()
+                await query.message.reply_text(
+                    render_plan(day, day_obj),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_today_keyboard(day_obj),
+                )
+                return
+
+            day = tomorrow_str()
+            day_obj = add_task_to_day(state, day, pending_text)
+            save_user_state(user_id, state)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
+            await query.answer()
+            await query.message.reply_text(
+                f"✅ Добавил задачу на {format_date_ru(day)}: {pending_text}"
+            )
+            await query.message.reply_text(render_day_preview(day, day_obj, include_text=pending_text))
+            return
+
+        if mode == "reopen_today":
+            context.user_data["add_mode"] = "reopen_today"
+            context.user_data.pop("add_date", None)
+            await query.answer()
+            await query.message.reply_text(
+                "Напиши текст задачи одним сообщением.",
+                reply_markup=build_cancel_keyboard(),
+            )
             return
 
         context.user_data["add_mode"] = mode
