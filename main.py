@@ -29,6 +29,8 @@ DEFAULT_TASKS = [
     "5 мин итог: что понял/что повторить",
 ]
 
+BACKLOG_TTL_DAYS = 7
+
 
 def today_str() -> str:
     return date.today().isoformat()
@@ -109,7 +111,7 @@ def render_plan(day: str, day_obj: Dict[str, Any]) -> str:
 
 def build_start_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["📌 План на сегодня"], ["🌙 Итог дня"]],
+        [["📌 План на сегодня"], ["🌙 Итог дня"], ["🗂 Бэклог"]],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -161,6 +163,123 @@ def ensure_min_tasks(day_obj: Dict[str, Any], min_count: int = 3) -> None:
     day_obj["tasks"] = normalize_task_ids(tasks)
 
 
+def get_backlog(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    backlog = state.setdefault("backlog", [])
+    if backlog is None:
+        backlog = []
+        state["backlog"] = backlog
+    return backlog
+
+
+def parse_iso(dt_str: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(dt_str)
+    except Exception:
+        return None
+
+
+def backlog_sort_key(item: Dict[str, Any]) -> datetime:
+    dt = parse_iso(str(item.get("created_at", "")))
+    return dt if dt else datetime.max
+
+
+def is_backlog_overdue(item: Dict[str, Any], now: datetime) -> bool:
+    dt = parse_iso(str(item.get("created_at", "")))
+    if not dt:
+        return False
+    return now - dt > timedelta(days=BACKLOG_TTL_DAYS)
+
+
+def next_backlog_id(backlog: List[Dict[str, Any]]) -> int:
+    max_id = 0
+    for item in backlog:
+        try:
+            max_id = max(max_id, int(item.get("id", 0)))
+        except Exception:
+            continue
+    return max_id + 1
+
+
+def find_backlog_item(backlog: List[Dict[str, Any]], item_id: int) -> Optional[Dict[str, Any]]:
+    for item in backlog:
+        try:
+            if int(item.get("id", 0)) == item_id:
+                return item
+        except Exception:
+            continue
+    return None
+
+
+def find_backlog_by_text(backlog: List[Dict[str, Any]], text: str) -> Optional[Dict[str, Any]]:
+    for item in backlog:
+        if item.get("text") == text:
+            return item
+    return None
+
+
+def maybe_pull_from_backlog(state: Dict[str, Any], day_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    backlog = get_backlog(state)
+    if not backlog:
+        return None
+
+    oldest = sorted(backlog, key=backlog_sort_key)[0]
+    oldest["last_seen_at"] = now_iso()
+
+    tasks = day_obj.get("tasks", [])
+    task_texts = {t.get("text") for t in tasks}
+    if oldest.get("text") in task_texts:
+        return None
+
+    backlog.remove(oldest)
+    tasks.append(
+        {
+            "id": len(tasks) + 1,
+            "text": oldest.get("text"),
+            "status": "todo",
+            "created_at": oldest.get("created_at", now_iso()),
+            "done_at": None,
+            "carried_from": oldest.get("source_day"),
+            "carry_count": int(oldest.get("carry_count", 0) or 0),
+        }
+    )
+    day_obj["tasks"] = normalize_task_ids(tasks)
+    return oldest
+
+
+def render_backlog(backlog: List[Dict[str, Any]]) -> str:
+    if not backlog:
+        return "🗂 Бэклог пуст."
+
+    lines = ["🗂 <b>Бэклог</b>"]
+    for item in sorted(backlog, key=backlog_sort_key):
+        created_at = str(item.get("created_at", ""))[:10]
+        lines.append(f"<b>{item.get('id')})</b> {item.get('text')} ({created_at})")
+    return "\n".join(lines)
+
+
+def render_overdue_backlog(items: List[Dict[str, Any]]) -> str:
+    lines = ["⚠️ <b>Просроченные задачи в бэклоге</b>"]
+    for item in items:
+        created_at = str(item.get("created_at", ""))[:10]
+        lines.append(f"<b>{item.get('id')})</b> {item.get('text')} ({created_at})")
+    lines.append("\nВыбери действие:")
+    return "\n".join(lines)
+
+
+def build_overdue_keyboard(items: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = []
+    for item in items:
+        item_id = item.get("id")
+        rows.append(
+            [
+                InlineKeyboardButton("✂️ Сжать формулировку", callback_data=f"backlog:shorten:{item_id}"),
+                InlineKeyboardButton("🗑 Удалить из backlog", callback_data=f"backlog:delete:{item_id}"),
+                InlineKeyboardButton("↩️ Вернуть сегодня", callback_data=f"backlog:return:{item_id}"),
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
 def apply_done(day_obj: Dict[str, Any], task_id: int) -> tuple[bool, str]:
     if day_obj.get("closed"):
         return False, "Сегодняшний день уже закрыт. Напиши /today чтобы начать новый план."
@@ -185,6 +304,8 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
 
     done_tasks = [t for t in tasks if t["status"] == "done"]
     todo_tasks = [t for t in tasks if t["status"] != "done"]
+    backlog = get_backlog(state)
+    existing_backlog_texts = {b.get("text") for b in backlog}
 
     # Закрываем текущий день
     day_obj["closed"] = True
@@ -196,9 +317,32 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
     if tomorrow_obj.get("closed"):
         tomorrow_obj["closed"] = False
 
-    # Переносим невыполненные (в статус todo)
+    # Переносим невыполненные (в статус todo) или отправляем в бэклог
     carry = []
+    carry_report = []
+    backlog_items = []
     for t in todo_tasks:
+        carry_count = int(t.get("carry_count", 0) or 0) + 1
+        if carry_count >= 3:
+            if t.get("text") in existing_backlog_texts:
+                existing = find_backlog_by_text(backlog, t.get("text"))
+                if existing:
+                    existing["carry_count"] = max(int(existing.get("carry_count", 0) or 0), carry_count)
+                    existing["last_seen_at"] = now_iso()
+            else:
+                item = {
+                    "id": next_backlog_id(backlog),
+                    "text": t.get("text"),
+                    "created_at": now_iso(),
+                    "source_day": day,
+                    "last_seen_at": now_iso(),
+                    "carry_count": carry_count,
+                }
+                backlog.append(item)
+                existing_backlog_texts.add(t.get("text"))
+                backlog_items.append(item)
+            continue
+
         carry.append(
             {
                 "id": 0,
@@ -207,8 +351,10 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
                 "created_at": now_iso(),
                 "done_at": None,
                 "carried_from": day,
+                "carry_count": carry_count,
             }
         )
+        carry_report.append(t)
 
     # Добавляем перенесённые в начало завтрашних задач (без дублей по тексту)
     existing_texts = {t["text"] for t in tomorrow_obj.get("tasks", [])}
@@ -232,13 +378,19 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
         for t in done_tasks:
             lines.append(f"✅ {t['id']}) {t['text']}")
 
-    lines += [
-        "",
-        "<b>⬜ Не сделано (перенёс на завтра):</b>" if todo_tasks else "<b>⬜ Не сделано:</b> —",
-    ]
-    if todo_tasks:
-        for t in todo_tasks:
+    if carry_report:
+        lines += ["", "<b>⬜ Не сделано (перенёс на завтра):</b>"]
+        for t in carry_report:
             lines.append(f"⬜ {t['id']}) {t['text']}")
+    elif backlog_items:
+        lines += ["", "<b>⬜ Не сделано (перенёс на завтра):</b> —"]
+    else:
+        lines += ["", "<b>⬜ Не сделано:</b> —"]
+
+    if backlog_items:
+        lines += ["", "<b>🗂 В бэклог:</b>"]
+        for t in backlog_items:
+            lines.append(f"🗂 {t.get('text')}")
 
     lines += ["", f"📌 <b>Черновик на завтра ({tmr}):</b>"]
     for t in tomorrow_obj["tasks"]:
@@ -274,12 +426,23 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not day_obj.get("tasks"):
         create_default_plan(day_obj)
 
+    maybe_pull_from_backlog(state, day_obj)
     save_user_state(user_id, state)
     await update.message.reply_text(
         render_plan(day, day_obj),
         parse_mode=ParseMode.HTML,
         reply_markup=build_today_keyboard(),
     )
+
+    backlog = get_backlog(state)
+    now = datetime.now()
+    overdue_items = [item for item in backlog if is_backlog_overdue(item, now)]
+    if overdue_items:
+        await update.message.reply_text(
+            render_overdue_backlog(overdue_items),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_overdue_keyboard(overdue_items),
+        )
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -332,10 +495,40 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update.message:
         return
     text = (update.message.text or "").strip()
+    user_id = update.effective_user.id
+    button_labels = {"📌 План на сегодня", "🌙 Итог дня", "🗂 Бэклог"}
+
+    if text and text not in button_labels:
+        state = load_user_state(user_id)
+        pending = state.get("backlog_edit")
+        if isinstance(pending, dict) and pending.get("id") is not None:
+            try:
+                item_id = int(pending.get("id"))
+            except Exception:
+                item_id = None
+
+            backlog = get_backlog(state)
+            item = find_backlog_item(backlog, item_id) if item_id is not None else None
+            state.pop("backlog_edit", None)
+            if item:
+                item["text"] = text
+                item["last_seen_at"] = now_iso()
+                save_user_state(user_id, state)
+                await update.message.reply_text("✂️ Обновил формулировку.")
+                await update.message.reply_text(render_backlog(backlog), parse_mode=ParseMode.HTML)
+            else:
+                save_user_state(user_id, state)
+                await update.message.reply_text("Не нашёл задачу в бэклоге.")
+            return
+
     if text == "📌 План на сегодня":
         await cmd_today(update, context)
     elif text == "🌙 Итог дня":
         await cmd_evening(update, context)
+    elif text == "🗂 Бэклог":
+        state = load_user_state(user_id)
+        backlog = get_backlog(state)
+        await update.message.reply_text(render_backlog(backlog), parse_mode=ParseMode.HTML)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -368,6 +561,77 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=build_today_keyboard(),
         )
         await query.answer(message)
+        return
+
+    if data.startswith("backlog:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await query.answer("Неверные данные.", show_alert=True)
+            return
+
+        action = parts[1]
+        try:
+            item_id = int(parts[2])
+        except ValueError:
+            await query.answer("Неверный номер задачи.", show_alert=True)
+            return
+
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        backlog = get_backlog(state)
+        item = find_backlog_item(backlog, item_id)
+        if not item:
+            await query.answer("Задача не найдена в бэклоге.", show_alert=True)
+            return
+
+        if action == "shorten":
+            state["backlog_edit"] = {"id": item_id, "action": "shorten"}
+            save_user_state(user_id, state)
+            await query.answer("Жду новую формулировку.")
+            await query.message.reply_text("Напиши новую формулировку задачи.")
+            return
+
+        if action == "delete":
+            backlog.remove(item)
+            save_user_state(user_id, state)
+            await query.answer("Удалил из бэклога.")
+            await query.message.reply_text("🗑 Удалил из бэклога.")
+            return
+
+        if action == "return":
+            day = today_str()
+            day_obj = get_day(state, day)
+            if day_obj.get("closed"):
+                await query.answer("День уже закрыт. Напиши /today чтобы открыть новый.", show_alert=True)
+                return
+
+            tasks = day_obj.get("tasks", [])
+            task_texts = {t.get("text") for t in tasks}
+            if item.get("text") not in task_texts:
+                tasks.append(
+                    {
+                        "id": len(tasks) + 1,
+                        "text": item.get("text"),
+                        "status": "todo",
+                        "created_at": item.get("created_at", now_iso()),
+                        "done_at": None,
+                        "carried_from": item.get("source_day"),
+                        "carry_count": int(item.get("carry_count", 0) or 0),
+                    }
+                )
+                day_obj["tasks"] = normalize_task_ids(tasks)
+
+            backlog.remove(item)
+            save_user_state(user_id, state)
+            await query.message.reply_text(
+                render_plan(day, day_obj),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_today_keyboard(),
+            )
+            await query.answer("Вернул в план на сегодня.")
+            return
+
+        await query.answer("Неизвестное действие.", show_alert=True)
         return
 
     if data == "evening":
