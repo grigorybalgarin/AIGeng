@@ -650,6 +650,8 @@ def render_habits_week(state: Dict[str, Any], week_start: date, selected_date: d
     start_iso = week_dates[0].isoformat()
     end_iso = week_dates[-1].isoformat()
 
+    col_w = 4
+    gap = " "
     titles = [str(h.get("title", "")) for h in config]
     max_title = max([len(t) for t in titles] + [5])
     day_labels = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
@@ -659,10 +661,10 @@ def render_habits_week(state: Dict[str, Any], week_start: date, selected_date: d
     header_cells = []
     for idx, label in enumerate(day_labels):
         if selected_idx == idx:
-            header_cells.append(f"【{label}】")
+            header_cells.append(f"[{label}]")
         else:
             header_cells.append(f" {label} ")
-    header = " " * (max_title + 1) + "".join(f"{cell:<4}" for cell in header_cells)
+    header = " " * (max_title + 1) + gap.join(f"{cell:<{col_w}}" for cell in header_cells)
 
     lines = [header]
     for habit in config:
@@ -676,8 +678,8 @@ def render_habits_week(state: Dict[str, Any], week_start: date, selected_date: d
                 mark = "⬜"
             else:
                 mark = "🟩" if day_log.get(key, False) else "🟥"
-            row.append(f"{mark} ")
-        line = f"{row[0]} " + "".join(f"{cell:<4}" for cell in row[1:])
+            row.append(mark)
+        line = f"{row[0]} " + gap.join(f"{cell:<{col_w}}" for cell in row[1:])
         lines.append(line)
 
     header_line = f"✅ Привычки — неделя {format_date_ru(start_iso)}–{format_date_ru(end_iso)}"
@@ -708,6 +710,13 @@ def build_habits_keyboard(state: Dict[str, Any], selected_date: date) -> InlineK
             InlineKeyboardButton("⚙️ Настроить", callback_data="hab:settings"),
         ]
     )
+    rows.append(
+        [
+            InlineKeyboardButton("◀️ Неделя", callback_data="hab:week_prev"),
+            InlineKeyboardButton("▶️ Неделя", callback_data="hab:week_next"),
+        ]
+    )
+    rows.append([InlineKeyboardButton("🏠 Главная", callback_data="hab:home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1297,10 +1306,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if context.user_data.get("awaiting_del_id"):
         ids = parse_task_ids_input(text)
         if not ids:
-            await update.message.reply_text(
-                "Введите номер(а) задачи: 2 или 2,4,5",
-                reply_markup=build_cancel_keyboard(),
-            )
+            await update.message.reply_text("Можно: 2 или 2,4,5", reply_markup=build_cancel_keyboard())
             return
 
         state = load_user_state(user_id)
@@ -1326,8 +1332,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["view_scope"] = "day"
         context.user_data["view_day"] = day
         context.user_data["active_day"] = day
-        removed_text = ", ".join(f"{t.get('id')}) {t.get('text')}" for t in removed)
-        await update.message.reply_text(f"🗑 Удалил задачи: {removed_text}")
+        removed_ids = [t.get("id") for t in removed]
+        removed_text = ", ".join(str(i) for i in removed_ids)
+        await update.message.reply_text(f"🗑 Удалено {len(removed_ids)} задач: {removed_text}")
         reply_markup = build_today_keyboard(day_obj) if day == today_str() and not day_obj.get("closed") else None
         await update.message.reply_text(
             render_plan(day, day_obj, show_hint=bool(reply_markup)),
@@ -1478,15 +1485,10 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             day = today_str()
             day_obj = get_day(state, day)
             if day_obj.get("closed"):
-                context.user_data["pending_add_text"] = text
-                context.user_data.pop("add_mode", None)
-                context.user_data.pop("add_date", None)
-                context.user_data.pop("awaiting_task_text", None)
-                await update.message.reply_text(
-                    "Сегодня уже закрыто. Куда добавить задачу?",
-                    reply_markup=build_add_today_closed_keyboard(),
-                )
-                return
+                day_obj["closed"] = False
+                day_obj.pop("closed_at", None)
+                if not day_obj.get("tasks"):
+                    create_default_plan(day_obj)
 
             day_obj = add_task_to_day(state, day, text)
             save_user_state(user_id, state)
@@ -1710,7 +1712,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         tasks = [t for t in day_obj.get("tasks", []) if t.get("id") != task_id]
         day_obj["tasks"] = normalize_task_ids(tasks)
         save_user_state(user_id, state)
-        await query.answer("Удалил.")
+        await query.answer(f"🗑 Удалено: {shorten_text(str(task.get('text', '')), 24)}")
         if not day_obj.get("tasks"):
             await query.message.edit_text(
                 f"Задачи на {format_date_ru(day)} отсутствуют.",
@@ -1838,6 +1840,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not week_start:
             week_start = week_start_for(selected_date)
 
+        if data == "hab:home":
+            reset_input_modes(context)
+            await query.answer()
+            await query.message.reply_text(get_start_message(), reply_markup=build_start_keyboard())
+            return
         if data == "hab:back":
             await query.answer()
             await query.message.edit_text(
