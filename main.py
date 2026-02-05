@@ -136,11 +136,11 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📌 План на сегодня"],
+            ["📅 План по дате"],
             ["➕ Добавить задачу"],
             ["🗑 Удалить задачу"],
             ["🌙 Итог дня"],
             ["📦 Бэклог"],
-            ["❌ Отмена"],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -150,11 +150,15 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
 def build_today_keyboard(day_obj: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows = []
     tasks = day_obj.get("tasks", [])
-    for t in tasks[:10]:
+    shown = 0
+    for t in tasks:
+        if t.get("status") == "done":
+            continue
         task_id = t.get("id")
-        is_done = t.get("status") == "done"
-        icon = "✅" if is_done else "☑️"
-        rows.append([InlineKeyboardButton(f"{icon} Сделал {task_id}", callback_data=f"done:{task_id}")])
+        rows.append([InlineKeyboardButton(f"✅ Сделал {task_id}", callback_data=f"done:{task_id}")])
+        shown += 1
+        if shown >= 10:
+            break
     rows.append([InlineKeyboardButton("🌙 Итог дня", callback_data="evening")])
     return InlineKeyboardMarkup(rows)
 
@@ -170,6 +174,7 @@ def build_add_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Выбрать дату", callback_data="add:date"),
                 InlineKeyboardButton("В бэклог", callback_data="add:backlog"),
             ],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
         ]
     )
 
@@ -367,6 +372,7 @@ def build_backlog_pick_keyboard(backlog: List[Dict[str, Any]], limit: int = 10) 
         label = f"№{item_id} {shorten_text(str(item.get('text', '')))}"
         rows.append([InlineKeyboardButton(label, callback_data=f"pick:{item_id}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pick:back")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -376,9 +382,13 @@ def build_move_keyboard(item_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Сегодня", callback_data=f"move:{item_id}:today")],
             [InlineKeyboardButton("Завтра", callback_data=f"move:{item_id}:tomorrow")],
             [InlineKeyboardButton("Выбрать дату", callback_data=f"move:{item_id}:date")],
-            [InlineKeyboardButton("Отмена", callback_data="move:cancel")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
         ]
     )
+
+
+def build_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
 
 
 def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -388,6 +398,7 @@ def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("add_date", None)
     context.user_data.pop("move_mode", None)
     context.user_data.pop("move_task_id", None)
+    context.user_data.pop("view_date_mode", None)
 
 
 def render_day_preview(
@@ -663,6 +674,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     button_labels = {
         "📌 План на сегодня",
+        "📅 План по дате",
         "➕ Добавить задачу",
         "🗑 Удалить задачу",
         "🌙 Итог дня",
@@ -679,10 +691,17 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             save_user_state(user_id, state)
 
         if text == "❌ Отмена":
-            await update.message.reply_text("Отменил.")
+            await update.message.reply_text("Ок, отменил.", reply_markup=build_start_keyboard())
             return
         if text == "📌 План на сегодня":
             await cmd_today(update, context)
+            return
+        if text == "📅 План по дате":
+            context.user_data["view_date_mode"] = True
+            await update.message.reply_text(
+                "Введи дату в формате ДД.ММ.ГГГГ",
+                reply_markup=build_cancel_keyboard(),
+            )
             return
         if text == "➕ Добавить задачу":
             await cmd_add(update, context)
@@ -693,10 +712,14 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data["del_mode"] = view_scope
             context.user_data["awaiting_del_id"] = True
             if view_scope == "backlog":
-                await update.message.reply_text("Введи номер задачи для удаления (Бэклог).")
+                await update.message.reply_text(
+                    "Введи номер задачи для удаления (Бэклог).",
+                    reply_markup=build_cancel_keyboard(),
+                )
             else:
                 await update.message.reply_text(
-                    f"Введи номер задачи для удаления (План: {format_date_ru(view_day)})"
+                    f"Введи номер задачи для удаления (План: {format_date_ru(view_day)})",
+                    reply_markup=build_cancel_keyboard(),
                 )
             return
         if text == "🌙 Итог дня":
@@ -709,8 +732,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if not backlog:
                 await update.message.reply_text("Бэклог пуст.")
                 return
-            message = render_backlog_pick_list(backlog)
-            message += "\n\nЧтобы удалить: нажми 🗑 Удалить задачу и введи номер."
+            message = "Нажми на задачу, чтобы перенести её на день. Для удаления — 🗑 и номер."
+            message += "\n\n" + render_backlog_pick_list(backlog)
             await update.message.reply_text(
                 message,
                 parse_mode=ParseMode.HTML,
@@ -718,11 +741,32 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return
 
+    if context.user_data.get("view_date_mode"):
+        iso_date = parse_date_input(text)
+        if not iso_date:
+            await update.message.reply_text(
+                "Введи дату в формате ДД.ММ.ГГГГ",
+                reply_markup=build_cancel_keyboard(),
+            )
+            return
+
+        state = load_user_state(user_id)
+        day_obj = get_day(state, iso_date)
+        save_user_state(user_id, state)
+        context.user_data.pop("view_date_mode", None)
+        context.user_data["view_scope"] = "day"
+        context.user_data["view_day"] = iso_date
+        await update.message.reply_text(render_plan(iso_date, day_obj), parse_mode=ParseMode.HTML)
+        return
+
     if context.user_data.get("awaiting_del_id"):
         try:
             task_id = int(text)
         except ValueError:
-            await update.message.reply_text("Номер должен быть числом. Введи номер задачи.")
+            await update.message.reply_text(
+                "Номер должен быть числом. Введи номер задачи.",
+                reply_markup=build_cancel_keyboard(),
+            )
             return
 
         state = load_user_state(user_id)
@@ -731,7 +775,10 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             backlog = get_backlog(state)
             item = find_backlog_item(backlog, task_id)
             if not item:
-                await update.message.reply_text(f"Не нашёл задачу с номером {task_id}. Введи другой номер.")
+                await update.message.reply_text(
+                    f"Не нашёл задачу с номером {task_id}. Введи другой номер.",
+                    reply_markup=build_cancel_keyboard(),
+                )
                 return
             backlog.remove(item)
             backlog[:] = normalize_task_ids_backlog(backlog)
@@ -755,7 +802,10 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         task = find_task(day_obj, task_id)
         if not task:
-            await update.message.reply_text(f"Не нашёл задачу с номером {task_id}. Введи другой номер.")
+            await update.message.reply_text(
+                f"Не нашёл задачу с номером {task_id}. Введи другой номер.",
+                reply_markup=build_cancel_keyboard(),
+            )
             return
 
         tasks = [t for t in day_obj.get("tasks", []) if t.get("id") != task_id]
@@ -776,7 +826,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         iso_date = parse_date_input(text)
         if not iso_date:
             await update.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026"
+                "Введите дату в формате ДД.ММ.ГГГГ, например 08.02.2026",
+                reply_markup=build_cancel_keyboard(),
             )
             return
 
@@ -809,7 +860,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(
             f"✅ Перенёс на {format_date_ru(day)}: {item.get('text')}"
         )
-        await update.message.reply_text(render_day_preview(day, day_obj, include_text=item.get("text")))
+        await update.message.reply_text(render_plan(day, day_obj), parse_mode=ParseMode.HTML)
         return
 
     add_mode = context.user_data.get("add_mode")
@@ -818,11 +869,15 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             iso_date = parse_date_input(text)
             if not iso_date:
                 await update.message.reply_text(
-                    "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026"
+                    "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
+                    reply_markup=build_cancel_keyboard(),
                 )
                 return
             context.user_data["add_date"] = iso_date
-            await update.message.reply_text("Напиши текст задачи одним сообщением.")
+            await update.message.reply_text(
+                "Напиши текст задачи одним сообщением.",
+                reply_markup=build_cancel_keyboard(),
+            )
             return
 
         state = load_user_state(user_id)
@@ -857,7 +912,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             day = context.user_data.get("add_date")
             if not day:
                 await update.message.reply_text(
-                    "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026"
+                    "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
+                    reply_markup=build_cancel_keyboard(),
                 )
                 return
             day_obj = add_task_to_day(state, day, text)
@@ -925,6 +981,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     data = query.data or ""
+    if data == "cancel":
+        reset_input_modes(context)
+        await query.answer()
+        await query.message.reply_text("Ок, отменил.", reply_markup=build_start_keyboard())
+        return
+
     if data.startswith("done:"):
         try:
             task_id = int(data.split(":", 1)[1])
@@ -968,10 +1030,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         if mode == "date":
             await query.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026"
+                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
+                reply_markup=build_cancel_keyboard(),
             )
         else:
-            await query.message.reply_text("Напиши текст задачи одним сообщением.")
+            await query.message.reply_text(
+                "Напиши текст задачи одним сообщением.",
+                reply_markup=build_cancel_keyboard(),
+            )
         return
 
     if data.startswith("pick:"):
@@ -1013,10 +1079,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith("move:"):
         parts = data.split(":")
         if len(parts) == 2 and parts[1] == "cancel":
-            context.user_data.pop("move_mode", None)
-            context.user_data.pop("move_task_id", None)
+            reset_input_modes(context)
             await query.answer()
-            await query.message.reply_text("Ок, отменил.")
+            await query.message.reply_text("Ок, отменил.", reply_markup=build_start_keyboard())
             return
 
         if len(parts) != 3:
@@ -1039,7 +1104,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.pop("awaiting_del_id", None)
             await query.answer()
             await query.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026"
+                "Введите дату в формате ДД.ММ.ГГГГ, например 08.02.2026",
+                reply_markup=build_cancel_keyboard(),
             )
             return
 
