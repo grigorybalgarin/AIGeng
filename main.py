@@ -16,6 +16,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
+
 
 
 DATA_DIR = Path("data")
@@ -90,18 +92,18 @@ def create_default_plan(day_obj: Dict[str, Any]) -> None:
 def render_plan(day: str, day_obj: Dict[str, Any]) -> str:
     lines = [f"📌 <b>План на {day}</b>"]
     if day_obj.get("closed"):
-        lines.append("⚠️ День закрыт (история). Используй /today чтобы создать план на сегодня.")
+        lines.append("⚠️ День закрыт (история).")
         return "\n".join(lines)
 
     tasks: List[Dict[str, Any]] = day_obj.get("tasks", [])
     if not tasks:
-        lines.append("Пока задач нет. Напиши /today ещё раз — создам шаблон.")
+        lines.append("Пока задач нет.")
         return "\n".join(lines)
 
     for t in tasks:
         mark = "✅" if t["status"] == "done" else "⬜"
         lines.append(f"{mark} <b>{t['id']})</b> {t['text']}")
-    lines.append("\nКоманды: /done 2, /evening")
+    lines.append("\nОтмечай выполненное кнопками ниже.")
     return "\n".join(lines)
 
 
@@ -397,7 +399,14 @@ def main() -> None:
 
     ensure_data_dir()
 
-    app = Application.builder().token(token).build()
+    request = HTTPXRequest(
+        connect_timeout=20,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+    app = Application.builder().token(token).request(request).build()
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("done", cmd_done))
