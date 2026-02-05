@@ -162,7 +162,8 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
             ["➕ Добавить задачу", "📦 Бэклог"],
             ["🗑 Удалить задачу", "📅 План по дате"],
             ["📋 Отчёт дня", "🔔 Тест уведомления"],
-            ["🔔 Уведомления", "🏠 Главная"],
+            ["🔔 Уведомления", "📊 Статистика"],
+            ["🏠 Главная"],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -596,6 +597,7 @@ def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("habits_selected_date", None)
     context.user_data.pop("habits_selected_day", None)
     context.user_data.pop("habits_week_start", None)
+    context.user_data.pop("habits_screen", None)
 
 
 def render_day_preview(
@@ -643,12 +645,26 @@ def sanitize_habit_name(name: str) -> str:
 
 
 def habit_state(value: Any) -> str:
-    if value is True or value == "done":
-        return "done"
-    if value is False or value == "skip":
-        return "skip"
-    if value == "none":
+    if value is None:
         return "none"
+    if value is True:
+        return "done"
+    if value is False:
+        return "skip"
+    if isinstance(value, int):
+        if value == 1:
+            return "done"
+        if value == 2:
+            return "skip"
+        return "none"
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"1", "done", "yes", "y", "true", "да"}:
+            return "done"
+        if raw in {"2", "skip", "no", "n", "false", "нет"}:
+            return "skip"
+        if raw in {"0", "none", ""}:
+            return "none"
     return "none"
 
 
@@ -661,13 +677,34 @@ def habit_mark(value: Any) -> str:
     return "⬜"
 
 
-def habit_next_value(value: Any) -> Optional[str]:
+def habit_next_value(value: Any) -> Any:
     state = habit_state(value)
-    if state == "none":
-        return "done"
-    if state == "done":
-        return "skip"
-    return None
+    next_state = "done" if state == "none" else "skip" if state == "done" else "none"
+
+    if value is True or value is False:
+        if next_state == "none":
+            return None
+        return True if next_state == "done" else False
+
+    if isinstance(value, int):
+        return 1 if next_state == "done" else 2 if next_state == "skip" else 0
+
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"yes", "no", "none"}:
+            return "yes" if next_state == "done" else "no" if next_state == "skip" else "none"
+        if raw in {"done", "skip", "none", ""}:
+            return "done" if next_state == "done" else "skip" if next_state == "skip" else "none"
+        if raw in {"1", "2", "0"}:
+            return "1" if next_state == "done" else "2" if next_state == "skip" else "0"
+        if raw in {"true", "false"}:
+            if next_state == "none":
+                return None
+            return "true" if next_state == "done" else "false"
+
+    if next_state == "none":
+        return None
+    return "done" if next_state == "done" else "skip"
 
 
 def week_start_for(day: date) -> date:
@@ -688,19 +725,18 @@ def render_habits_week(state: Dict[str, Any], week_start: date, selected_date: d
     name_w = 16
     cell_w = 4
     gap = " "
-    titles = [sanitize_habit_name(str(h.get("title", ""))) for h in config]
-    max_title = max([min(len(t), name_w) for t in titles] + [5])
     day_labels = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
     selected_idx = None
     if week_dates[0] <= selected_date <= week_dates[-1]:
         selected_idx = (selected_date - week_dates[0]).days
+    def fmt_cell(text: str) -> str:
+        return f"{text:^{cell_w}}"
+
     header_cells = []
     for idx, label in enumerate(day_labels):
-        if selected_idx == idx:
-            header_cells.append(f"[{label}]")
-        else:
-            header_cells.append(f" {label} ")
-    header = " " * (name_w + 1) + gap.join(f"{cell:<{cell_w}}" for cell in header_cells)
+        cell_text = f"[{label}]" if selected_idx == idx else label
+        header_cells.append(fmt_cell(cell_text))
+    header = " " * (name_w + 1) + gap.join(header_cells)
 
     lines = [header]
     for habit in config:
@@ -708,23 +744,22 @@ def render_habits_week(state: Dict[str, Any], week_start: date, selected_date: d
         if len(title) > name_w:
             title = title[: name_w - 1].rstrip() + "…"
         key = str(habit.get("key", ""))
-        row = [title.ljust(name_w)]
+        row_cells = []
         for d in week_dates:
             iso = d.isoformat()
             day_log = log.get(iso, {}) if isinstance(log.get(iso, {}), dict) else {}
-            mark = habit_mark(day_log.get(key)) if key in day_log else "⬜"
-            row.append(mark)
-        line = f"{row[0]} " + gap.join(f"{f' {cell} ':<{cell_w}}" for cell in row[1:])
+            mark = habit_mark(day_log.get(key))
+            row_cells.append(fmt_cell(mark))
+        line = f"{title.ljust(name_w)} " + gap.join(row_cells)
         lines.append(line)
 
-    header_line = f"✅ Привычки — неделя {format_date_ru(start_iso)}–{format_date_ru(end_iso)}"
+    header_line = f"Привычки: {format_date_ru(start_iso)}–{format_date_ru(end_iso)}"
     selected_label = day_labels[selected_idx] if selected_idx is not None else "--"
     edit_line = f"Выбран день: {selected_label} ({format_date_ru(selected_date.isoformat())})"
-    week_line = f"📅 НЕДЕЛЯ: {format_date_ru(start_iso)}—{format_date_ru(end_iso)}"
     table = "\n".join(lines)
     hint = "Нажми на привычку, чтобы отметить за выбранный день."
     return (
-        f"{html.escape(header_line)}\n{html.escape(week_line)}\n{html.escape(edit_line)}\n"
+        f"{html.escape(header_line)}\n{html.escape(edit_line)}\n"
         f"<pre>{html.escape(table)}</pre>\n{html.escape(hint)}"
     )
 
@@ -738,15 +773,22 @@ def build_habits_keyboard(state: Dict[str, Any], selected_date: date) -> InlineK
         key = str(habit.get("key", ""))
         title = sanitize_habit_name(str(habit.get("title", "")))
         day_log = log.get(selected_iso, {}) if isinstance(log.get(selected_iso, {}), dict) else {}
-        mark = habit_mark(day_log.get(key)) if key in day_log else "⬜"
+        mark = habit_mark(day_log.get(key))
         label = f"{mark} {title}"
         rows.append([InlineKeyboardButton(label, callback_data=f"hab:toggle:{key}")])
     rows.append(
         [
+            InlineKeyboardButton("📅 Выбрать день", callback_data="hab:pick_day"),
             InlineKeyboardButton("⚙️ Настроить", callback_data="hab:settings"),
-            InlineKeyboardButton("🏠 Главная", callback_data="hab:home"),
         ]
     )
+    rows.append(
+        [
+            InlineKeyboardButton("◀️ Неделя", callback_data="hab:week_prev"),
+            InlineKeyboardButton("▶️ Неделя", callback_data="hab:week_next"),
+        ]
+    )
+    rows.append([InlineKeyboardButton("🏠 Главная", callback_data="hab:home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -924,10 +966,90 @@ async def notify_test(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = data.get("chat_id")
     if not chat_id:
         return
+    stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
     await context.bot.send_message(
         chat_id=chat_id,
-        text="🔔 TEST: уведомления работают. (через 10 сек)",
+        text=f"🔔 Тест уведомления: работает ({stamp})",
     )
+
+
+def get_admin_ids() -> set[int]:
+    ids: set[int] = set()
+    raw = os.getenv("ADMIN_IDS", "")
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    single = os.getenv("ADMIN_ID", "").strip()
+    if single.isdigit():
+        ids.add(int(single))
+    return ids
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in get_admin_ids()
+
+
+def feedback_counts(feedback: Any) -> tuple[int, int, int]:
+    total = 0
+    yes = 0
+    no = 0
+    if feedback is None:
+        return total, yes, no
+
+    if isinstance(feedback, dict):
+        if "yes" in feedback or "no" in feedback:
+            try:
+                yes = int(feedback.get("yes", 0) or 0)
+            except Exception:
+                yes = 0
+            try:
+                no = int(feedback.get("no", 0) or 0)
+            except Exception:
+                no = 0
+            total = yes + no
+            return total, yes, no
+        if isinstance(feedback.get("items"), list):
+            feedback = feedback.get("items")
+        else:
+            feedback = list(feedback.values())
+
+    if isinstance(feedback, list):
+        for item in feedback:
+            value = item
+            if isinstance(item, dict):
+                value = item.get("value") or item.get("answer") or item.get("feedback") or item.get("text")
+            value = str(value).strip().lower()
+            if not value:
+                continue
+            total += 1
+            if value in {"yes", "y", "true", "1", "да", "👍"}:
+                yes += 1
+            elif value in {"no", "n", "false", "0", "нет", "👎"}:
+                no += 1
+    return total, yes, no
+
+
+def habits_week_stats(state: Dict[str, Any], week_start: date) -> tuple[int, int, int]:
+    config = state.get("habits_config")
+    if not isinstance(config, list) or not config:
+        config = HABITS_DEFAULT_CONFIG
+    log = state.get("habits_log") if isinstance(state.get("habits_log"), dict) else {}
+    done_count = 0
+    skip_count = 0
+    none_count = 0
+    for d in week_dates_for(week_start):
+        day_log = log.get(d.isoformat(), {}) if isinstance(log.get(d.isoformat(), {}), dict) else {}
+        for habit in config:
+            key = str(habit.get("key", ""))
+            state_val = habit_state(day_log.get(key))
+            if state_val == "done":
+                done_count += 1
+            elif state_val == "skip":
+                skip_count += 1
+            else:
+                none_count += 1
+    return done_count, skip_count, none_count
 
 
 def render_overdue_backlog(items: List[Dict[str, Any]]) -> str:
@@ -1124,11 +1246,51 @@ async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     context.user_data["view_scope"] = "habits"
     context.user_data["habits_selected_day"] = today.isoformat()
     context.user_data["habits_week_start"] = week_start.isoformat()
+    context.user_data["habits_screen"] = "main"
     await update.message.reply_text(
         render_habits_week(state, week_start, today),
         parse_mode=ParseMode.HTML,
         reply_markup=build_habits_keyboard(state, today),
     )
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Недоступно")
+        return
+
+    state = load_user_state(user_id)
+    days = state.get("days", {}) if isinstance(state.get("days"), dict) else {}
+    today_iso = today_str()
+    day_obj = days.get(today_iso, {}) if isinstance(days.get(today_iso, {}), dict) else {}
+    tasks = day_obj.get("tasks", []) if isinstance(day_obj.get("tasks", []), list) else []
+    total_tasks = len(tasks)
+    done_tasks = sum(1 for t in tasks if t.get("status") == "done")
+    todo_tasks = total_tasks - done_tasks
+
+    backlog = state.get("backlog") if isinstance(state.get("backlog"), list) else []
+    days_count = len(days)
+
+    week_start = week_start_for(date.today())
+    h_done, h_skip, h_none = habits_week_stats(state, week_start)
+    marked = h_done + h_skip
+    percent = round((h_done / marked) * 100) if marked else 0
+
+    lines = [
+        "📊 <b>Статистика</b>",
+        f"Сегодня: всего {total_tasks} / ✅ {done_tasks} / ⬜ {todo_tasks}",
+        f"Дней в истории: {days_count}",
+        f"Бэклог: {len(backlog)}",
+        f"Привычки (неделя): 🟩 {h_done}, 🟥 {h_skip}, ⬜ {h_none}, ✅ {percent}%",
+    ]
+
+    feedback = state.get("feedback")
+    if feedback is not None:
+        total_fb, yes_fb, no_fb = feedback_counts(feedback)
+        lines.append(f"Отзывы: всего {total_fb} (👍 {yes_fb}, 👎 {no_fb})")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1236,6 +1398,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "✅ Привычки",
         "🔔 Уведомления",
         "🔔 Тест уведомления",
+        "📊 Статистика",
         "🗂 Бэклог",
         "❌ Отмена",
     }
@@ -1278,20 +1441,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await cmd_habits(update, context)
             return
         if text == "🔔 Тест уведомления":
-            job_queue = context.application.job_queue
-            chat_id = update.effective_chat.id
-            if job_queue:
-                job_queue.run_once(
-                    notify_test,
-                    10,
-                    data={"chat_id": chat_id},
-                    name=f"notify_test_{update.effective_user.id}",
-                )
-                await update.message.reply_text("Ок, тестовое уведомление придёт через 10 сек.")
-            else:
-                await update.message.reply_text(
-                    "🔔 TEST: уведомления работают. (JobQueue недоступен — отправляю сразу)"
-                )
+            now_stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
+            await update.message.reply_text(f"🔔 Тест уведомления: работает ({now_stamp})")
             return
         if text == "🔔 Уведомления":
             state = load_user_state(user_id)
@@ -1306,6 +1457,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 text_msg,
                 reply_markup=build_notifications_keyboard(state),
             )
+            return
+        if text == "📊 Статистика":
+            await cmd_stats(update, context)
             return
         if text == "➕ Добавить задачу":
             await cmd_add(update, context)
@@ -1899,6 +2053,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             selected_date = today
         if not week_start:
             week_start = week_start_for(selected_date)
+        habits_screen = context.user_data.get("habits_screen", "main")
 
         if data == "hab:home":
             reset_input_modes(context)
@@ -1906,6 +2061,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text(get_start_message(), reply_markup=build_start_keyboard())
             return
         if data == "hab:back":
+            context.user_data["habits_screen"] = "main"
             await query.answer()
             await query.message.edit_text(
                 render_habits_week(state, week_start, selected_date),
@@ -1915,6 +2071,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         if data == "hab:settings":
             context.user_data.pop("awaiting_habit_title", None)
+            context.user_data["habits_screen"] = "settings"
             await query.answer()
             await query.message.edit_text(
                 render_habits_week(state, week_start, selected_date),
@@ -1953,6 +2110,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
         if data == "hab:pick_day":
+            context.user_data["habits_screen"] = "pick_day"
             await query.answer()
             await query.message.edit_text(
                 render_habits_week(state, week_start, selected_date),
@@ -1965,11 +2123,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["habits_week_start"] = week_start.isoformat()
             selected_date = week_start + timedelta(days=selected_date.weekday())
             context.user_data["habits_selected_day"] = selected_date.isoformat()
+            reply_markup = (
+                build_habits_settings_keyboard(week_start, selected_date)
+                if habits_screen == "settings"
+                else build_habits_keyboard(state, selected_date)
+            )
             await query.answer()
             await query.message.edit_text(
                 render_habits_week(state, week_start, selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_settings_keyboard(week_start, selected_date),
+                reply_markup=reply_markup,
             )
             return
         if data == "hab:week_next":
@@ -1977,16 +2140,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["habits_week_start"] = week_start.isoformat()
             selected_date = week_start + timedelta(days=selected_date.weekday())
             context.user_data["habits_selected_day"] = selected_date.isoformat()
+            reply_markup = (
+                build_habits_settings_keyboard(week_start, selected_date)
+                if habits_screen == "settings"
+                else build_habits_keyboard(state, selected_date)
+            )
             await query.answer()
             await query.message.edit_text(
                 render_habits_week(state, week_start, selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_settings_keyboard(week_start, selected_date),
+                reply_markup=reply_markup,
             )
             return
         if data.startswith("habits_pick_day:"):
             code = data.split(":", 1)[1]
             if code == "cancel":
+                context.user_data["habits_screen"] = "main"
                 await query.answer()
                 await query.message.edit_text(
                     render_habits_week(state, week_start, selected_date),
@@ -2002,6 +2171,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 selected_date = week_start + timedelta(days=idx)
             context.user_data["habits_selected_day"] = selected_date.isoformat()
             context.user_data["habits_week_start"] = week_start_for(selected_date).isoformat()
+            context.user_data["habits_screen"] = "main"
             await query.answer()
             await query.message.edit_text(
                 render_habits_week(state, week_start_for(selected_date), selected_date),
@@ -2021,6 +2191,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 log[selected_iso][key] = next_value
             state["habits_log"] = log
             save_user_state(user_id, state)
+            context.user_data["habits_screen"] = "main"
             await query.answer("Готово.")
             await query.message.edit_text(
                 render_habits_week(state, week_start, selected_date),
