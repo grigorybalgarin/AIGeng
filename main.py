@@ -111,7 +111,7 @@ def render_plan(day: str, day_obj: Dict[str, Any]) -> str:
 
 def build_start_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["📌 План на сегодня"], ["🌙 Итог дня"], ["🗂 Бэклог"]],
+        [["📌 План на сегодня"], ["➕ Добавить задачу"], ["🌙 Итог дня"], ["🗂 Бэклог"]],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -124,6 +124,21 @@ def build_today_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("✅ Сделал 2", callback_data="done:2")],
             [InlineKeyboardButton("✅ Сделал 3", callback_data="done:3")],
             [InlineKeyboardButton("🌙 Итог дня", callback_data="evening")],
+        ]
+    )
+
+
+def build_add_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data="add:today"),
+                InlineKeyboardButton("Завтра", callback_data="add:tomorrow"),
+            ],
+            [
+                InlineKeyboardButton("Выбрать дату", callback_data="add:date"),
+                InlineKeyboardButton("В бэклог", callback_data="add:backlog"),
+            ],
         ]
     )
 
@@ -143,6 +158,15 @@ def normalize_task_ids(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         t["id"] = i
         new_tasks.append(t)
     return new_tasks
+
+
+def normalize_task_ids_backlog(backlog: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    new_backlog = []
+    for i, item in enumerate(backlog, start=1):
+        item = dict(item)
+        item["id"] = i
+        new_backlog.append(item)
+    return new_backlog
 
 
 def ensure_min_tasks(day_obj: Dict[str, Any], min_count: int = 3) -> None:
@@ -169,6 +193,22 @@ def get_backlog(state: Dict[str, Any]) -> List[Dict[str, Any]]:
         backlog = []
         state["backlog"] = backlog
     return backlog
+
+
+def add_task_to_day(state: Dict[str, Any], day: str, text: str) -> Dict[str, Any]:
+    day_obj = get_day(state, day)
+    tasks = day_obj.get("tasks", [])
+    tasks.append(
+        {
+            "id": len(tasks) + 1,
+            "text": text,
+            "status": "todo",
+            "created_at": now_iso(),
+            "done_at": None,
+        }
+    )
+    day_obj["tasks"] = normalize_task_ids(tasks)
+    return day_obj
 
 
 def parse_iso(dt_str: str) -> Optional[datetime]:
@@ -231,6 +271,7 @@ def maybe_pull_from_backlog(state: Dict[str, Any], day_obj: Dict[str, Any]) -> O
         return None
 
     backlog.remove(oldest)
+    backlog[:] = normalize_task_ids_backlog(backlog)
     tasks.append(
         {
             "id": len(tasks) + 1,
@@ -254,6 +295,17 @@ def render_backlog(backlog: List[Dict[str, Any]]) -> str:
     for item in sorted(backlog, key=backlog_sort_key):
         created_at = str(item.get("created_at", ""))[:10]
         lines.append(f"<b>{item.get('id')})</b> {item.get('text')} ({created_at})")
+    return "\n".join(lines)
+
+
+def render_day_preview(day: str, day_obj: Dict[str, Any], limit: int = 3) -> str:
+    tasks: List[Dict[str, Any]] = day_obj.get("tasks", [])
+    if not tasks:
+        return f"План на {day} пока пуст."
+
+    lines = [f"Первые задачи на {day}:"]
+    for t in tasks[:limit]:
+        lines.append(f"{t.get('id')}) {t.get('text')}")
     return "\n".join(lines)
 
 
@@ -356,6 +408,8 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
         )
         carry_report.append(t)
 
+    state["backlog"] = normalize_task_ids_backlog(backlog)
+
     # Добавляем перенесённые в начало завтрашних задач (без дублей по тексту)
     existing_texts = {t["text"] for t in tomorrow_obj.get("tasks", [])}
     new_tasks = []
@@ -409,6 +463,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Жми кнопки ниже — это самый быстрый путь.",
         reply_markup=build_start_keyboard(),
     )
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Куда добавить задачу?", reply_markup=build_add_keyboard())
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -491,12 +549,84 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(report, parse_mode=ParseMode.HTML)
 
 
-async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     text = (update.message.text or "").strip()
+    if not text:
+        return
     user_id = update.effective_user.id
-    button_labels = {"📌 План на сегодня", "🌙 Итог дня", "🗂 Бэклог"}
+
+    add_mode = context.user_data.get("add_mode")
+    if add_mode:
+        if add_mode == "date" and not context.user_data.get("add_date"):
+            try:
+                date.fromisoformat(text)
+            except ValueError:
+                await update.message.reply_text("Введите дату в формате YYYY-MM-DD, например 2026-02-05")
+                return
+            context.user_data["add_date"] = text
+            await update.message.reply_text("Напиши текст задачи одним сообщением.")
+            return
+
+        state = load_user_state(user_id)
+        if add_mode == "today":
+            day = today_str()
+            day_obj = add_task_to_day(state, day, text)
+            save_user_state(user_id, state)
+            context.user_data.pop("add_mode", None)
+            context.user_data.pop("add_date", None)
+            await update.message.reply_text(
+                render_plan(day, day_obj),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_today_keyboard(),
+            )
+            return
+        if add_mode == "tomorrow":
+            day = tomorrow_str()
+            day_obj = add_task_to_day(state, day, text)
+            save_user_state(user_id, state)
+            context.user_data.pop("add_mode", None)
+            context.user_data.pop("add_date", None)
+            await update.message.reply_text(f"✅ Добавил задачу на {day}: {text}")
+            await update.message.reply_text(render_day_preview(day, day_obj))
+            return
+        if add_mode == "date":
+            day = context.user_data.get("add_date")
+            if not day:
+                await update.message.reply_text("Введите дату в формате YYYY-MM-DD, например 2026-02-05")
+                return
+            day_obj = add_task_to_day(state, day, text)
+            save_user_state(user_id, state)
+            context.user_data.pop("add_mode", None)
+            context.user_data.pop("add_date", None)
+            await update.message.reply_text(f"✅ Добавил задачу на {day}: {text}")
+            await update.message.reply_text(render_day_preview(day, day_obj))
+            return
+        if add_mode == "backlog":
+            backlog = get_backlog(state)
+            backlog.append(
+                {
+                    "id": len(backlog) + 1,
+                    "text": text,
+                    "status": "todo",
+                    "created_at": now_iso(),
+                    "done_at": None,
+                    "source_day": None,
+                    "last_seen_at": now_iso(),
+                    "carry_count": 0,
+                }
+            )
+            backlog = normalize_task_ids_backlog(backlog)
+            state["backlog"] = backlog
+            save_user_state(user_id, state)
+            context.user_data.pop("add_mode", None)
+            context.user_data.pop("add_date", None)
+            await update.message.reply_text(f"✅ Добавил в бэклог: {text}")
+            await update.message.reply_text(f"В бэклоге сейчас {len(backlog)} задач(и).")
+            return
+
+    button_labels = {"📌 План на сегодня", "➕ Добавить задачу", "🌙 Итог дня", "🗂 Бэклог"}
 
     if text and text not in button_labels:
         state = load_user_state(user_id)
@@ -523,6 +653,8 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if text == "📌 План на сегодня":
         await cmd_today(update, context)
+    elif text == "➕ Добавить задачу":
+        await cmd_add(update, context)
     elif text == "🌙 Итог дня":
         await cmd_evening(update, context)
     elif text == "🗂 Бэклог":
@@ -563,6 +695,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer(message)
         return
 
+    if data.startswith("add:"):
+        mode = data.split(":", 1)[1]
+        if mode not in {"today", "tomorrow", "date", "backlog"}:
+            await query.answer("Неверный режим.", show_alert=True)
+            return
+
+        context.user_data["add_mode"] = mode
+        context.user_data.pop("add_date", None)
+        await query.answer()
+        if mode == "date":
+            await query.message.reply_text("Введите дату в формате YYYY-MM-DD, например 2026-02-05")
+        else:
+            await query.message.reply_text("Напиши текст задачи одним сообщением.")
+        return
+
     if data.startswith("backlog:"):
         parts = data.split(":")
         if len(parts) != 3:
@@ -593,6 +740,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if action == "delete":
             backlog.remove(item)
+            backlog[:] = normalize_task_ids_backlog(backlog)
             save_user_state(user_id, state)
             await query.answer("Удалил из бэклога.")
             await query.message.reply_text("🗑 Удалил из бэклога.")
@@ -622,6 +770,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 day_obj["tasks"] = normalize_task_ids(tasks)
 
             backlog.remove(item)
+            backlog[:] = normalize_task_ids_backlog(backlog)
             save_user_state(user_id, state)
             await query.message.reply_text(
                 render_plan(day, day_obj),
@@ -676,7 +825,7 @@ def main() -> None:
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("evening", cmd_evening))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
     print("Bot is running... Press Ctrl+C to stop.")
     app.run_polling(close_loop=False)
