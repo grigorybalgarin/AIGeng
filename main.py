@@ -159,8 +159,7 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📌 План на сегодня", "➕ Добавить задачу"],
-            ["📦 Бэклог", "🧹 Разобрать бэклог"],
-            ["📥 Взять из бэклога", "📅 План по дате"],
+            ["📦 Бэклог", "📅 План по дате"],
             ["🗑 Удалить задачу", "✅ Привычки"],
             ["🔔 Уведомления", "🌙 Итог дня"],
             ["🏠 Главная"],
@@ -416,6 +415,57 @@ def shorten_text(text: str, max_len: int = 32) -> str:
     return text[: max_len - 1].rstrip() + "…"
 
 
+def parse_task_ids_input(text: str) -> Optional[List[int]]:
+    parts = re.split(r"[,\s]+", text.strip())
+    parts = [p for p in parts if p]
+    if not parts:
+        return None
+    try:
+        return [int(p) for p in parts]
+    except ValueError:
+        return None
+
+
+def build_delete_day_keyboard(state: Dict[str, Any], active_day: Optional[str]) -> InlineKeyboardMarkup:
+    days = state.get("days", {})
+    days_with_tasks = [d for d, obj in days.items() if obj.get("tasks")]
+    if not days_with_tasks:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+
+    rows = []
+    days_sorted = sorted(days_with_tasks, reverse=True)
+    if active_day and active_day in days_sorted:
+        rows.append(
+            [InlineKeyboardButton(f"Текущая: {format_date_ru(active_day)}", callback_data=f"del_pick_day:{active_day}")]
+        )
+        days_sorted.remove(active_day)
+
+    today = today_str()
+    tomorrow = tomorrow_str()
+    if today in days_sorted:
+        rows.append([InlineKeyboardButton("Сегодня", callback_data=f"del_pick_day:{today}")])
+        days_sorted.remove(today)
+    if tomorrow in days_sorted:
+        rows.append([InlineKeyboardButton("Завтра", callback_data=f"del_pick_day:{tomorrow}")])
+        days_sorted.remove(tomorrow)
+
+    for day in days_sorted[:7]:
+        rows.append([InlineKeyboardButton(format_date_ru(day), callback_data=f"del_pick_day:{day}")])
+
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_delete_tasks_keyboard(day: str, day_obj: Dict[str, Any]) -> InlineKeyboardMarkup:
+    rows = []
+    for task in day_obj.get("tasks", []):
+        label = f"🗑 {task.get('id')}) {shorten_text(str(task.get('text', '')), 32)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"del_one:{day}:{task.get('id')}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="del_back")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 def get_triage_items(backlog: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
     return sorted(backlog, key=backlog_sort_key)[:limit]
 
@@ -451,14 +501,29 @@ def build_triage_to_keyboard(item_id: int, include_today: bool = True) -> Inline
     return InlineKeyboardMarkup(rows)
 
 
+def backlog_item_date_label(item: Dict[str, Any]) -> str:
+    day = item.get("source_day") or item.get("carried_from")
+    if day:
+        try:
+            return date.fromisoformat(str(day)).strftime("%d.%m")
+        except Exception:
+            return format_date_ru(str(day))
+    created_at = item.get("created_at")
+    dt = parse_iso(str(created_at)) if created_at else None
+    if dt:
+        return dt.strftime("%d.%m")
+    return "--.--"
+
+
 def render_backlog_pick_list(backlog: List[Dict[str, Any]], limit: int = 10) -> str:
     if not backlog:
-        return "Бэклог пуст."
+        return "📦 Бэклог пуст."
     items = backlog[-limit:]
     lines = [f"📦 <b>Бэклог</b> ({len(backlog)} задач)"]
     lines.append("")
     for item in items:
-        lines.append(f"{item.get('id')}) {item.get('text')}")
+        date_tag = backlog_item_date_label(item)
+        lines.append(f"{item.get('id')}) {item.get('text')} [{date_tag}]")
     return "\n".join(lines)
 
 
@@ -467,9 +532,9 @@ def build_backlog_pick_keyboard(backlog: List[Dict[str, Any]], limit: int = 10) 
     items = backlog[-limit:]
     for item in items:
         item_id = item.get("id")
-        label = f"№{item_id} {shorten_text(str(item.get('text', '')), 28)}"
+        date_tag = backlog_item_date_label(item)
+        label = f"{shorten_text(str(item.get('text', '')), 24)} [{date_tag}]"
         rows.append([InlineKeyboardButton(label, callback_data=f"pick:{item_id}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="pick:back")])
     rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -480,6 +545,8 @@ def build_move_keyboard(item_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Сегодня", callback_data=f"move:{item_id}:today")],
             [InlineKeyboardButton("Завтра", callback_data=f"move:{item_id}:tomorrow")],
             [InlineKeyboardButton("Выбрать дату", callback_data=f"move:{item_id}:date")],
+            [InlineKeyboardButton("Удалить", callback_data=f"move:{item_id}:delete")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="move:back")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
         ]
     )
@@ -510,6 +577,7 @@ def build_date_list_keyboard(dates: List[str]) -> InlineKeyboardMarkup:
 def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("del_mode", None)
     context.user_data.pop("awaiting_del_id", None)
+    context.user_data.pop("del_day", None)
     context.user_data.pop("add_mode", None)
     context.user_data.pop("add_date", None)
     context.user_data.pop("awaiting_task_text", None)
@@ -526,6 +594,7 @@ def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("active_day", None)
     context.user_data.pop("awaiting_habit_title", None)
     context.user_data.pop("habits_selected_date", None)
+    context.user_data.pop("habits_selected_day", None)
     context.user_data.pop("habits_week_start", None)
 
 
@@ -584,7 +653,16 @@ def render_habits_week(state: Dict[str, Any], week_start: date, selected_date: d
     titles = [str(h.get("title", "")) for h in config]
     max_title = max([len(t) for t in titles] + [5])
     day_labels = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
-    header = " " * (max_title + 1) + "".join(f"{d} " for d in day_labels)
+    selected_idx = None
+    if week_dates[0] <= selected_date <= week_dates[-1]:
+        selected_idx = (selected_date - week_dates[0]).days
+    header_cells = []
+    for idx, label in enumerate(day_labels):
+        if selected_idx == idx:
+            header_cells.append(f"【{label}】")
+        else:
+            header_cells.append(f" {label} ")
+    header = " " * (max_title + 1) + "".join(f"{cell:<4}" for cell in header_cells)
 
     lines = [header]
     for habit in config:
@@ -594,9 +672,13 @@ def render_habits_week(state: Dict[str, Any], week_start: date, selected_date: d
         for d in week_dates:
             iso = d.isoformat()
             day_log = log.get(iso, {}) if isinstance(log.get(iso, {}), dict) else {}
-            mark = "🟩" if day_log.get(key, False) else "🟥"
+            if key not in day_log:
+                mark = "⬜"
+            else:
+                mark = "🟩" if day_log.get(key, False) else "🟥"
             row.append(f"{mark} ")
-        lines.append(f"{row[0]} " + "".join(row[1:]))
+        line = f"{row[0]} " + "".join(f"{cell:<4}" for cell in row[1:])
+        lines.append(line)
 
     header_line = f"✅ Привычки — неделя {format_date_ru(start_iso)}–{format_date_ru(end_iso)}"
     edit_line = f"Выбран день: {format_date_ru(selected_date.isoformat())}"
@@ -613,13 +695,17 @@ def build_habits_keyboard(state: Dict[str, Any], selected_date: date) -> InlineK
     for habit in config:
         key = str(habit.get("key", ""))
         title = str(habit.get("title", ""))
-        done = log.get(selected_iso, {}).get(key, False)
-        label = f"{'🟩' if done else '🟥'} {title}"
+        day_log = log.get(selected_iso, {}) if isinstance(log.get(selected_iso, {}), dict) else {}
+        if key not in day_log:
+            mark = "⬜"
+        else:
+            mark = "🟩" if day_log.get(key, False) else "🟥"
+        label = f"{mark} {title}"
         rows.append([InlineKeyboardButton(label, callback_data=f"hab:toggle:{key}")])
     rows.append(
         [
+            InlineKeyboardButton("📅 Выбрать день", callback_data="hab:pick_day"),
             InlineKeyboardButton("⚙️ Настроить", callback_data="hab:settings"),
-            InlineKeyboardButton("↩️ Назад", callback_data="hab:back"),
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -652,13 +738,14 @@ def build_habits_delete_keyboard(config: List[Dict[str, str]]) -> InlineKeyboard
 
 def build_habits_day_picker_keyboard(week_start: date) -> InlineKeyboardMarkup:
     week_dates = week_dates_for(week_start)
-    day_labels = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
+    day_labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    day_codes = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
     buttons = []
-    for label, d in zip(day_labels, week_dates):
-        buttons.append(InlineKeyboardButton(label, callback_data=f"hab:day:{d.isoformat()}"))
+    for label, code in zip(day_labels, day_codes):
+        buttons.append(InlineKeyboardButton(label, callback_data=f"habits_day:{code}"))
     rows = [buttons[:4], buttons[4:]]
-    rows.append([InlineKeyboardButton("Сегодня", callback_data="hab:day:today")])
-    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="hab:settings")])
+    rows.append([InlineKeyboardButton("Сегодня", callback_data="habits_day:today")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="habits_day:cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -935,6 +1022,24 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
     for t in tomorrow_obj["tasks"]:
         lines.append(f"⬜ <b>{t['id']})</b> {t['text']}")
 
+    # Привычки за сегодня
+    habits_config = get_habits_config(state)
+    habits_log = get_habits_log(state)
+    day_log = habits_log.get(day, {}) if isinstance(habits_log.get(day, {}), dict) else {}
+    done_count = 0
+    lines += ["", "✅ <b>Привычки за сегодня:</b>"]
+    for habit in habits_config:
+        key = str(habit.get("key", ""))
+        title = str(habit.get("title", ""))
+        if key not in day_log:
+            mark = "⬜"
+        else:
+            mark = "🟩" if day_log.get(key, False) else "🟥"
+        if day_log.get(key, False):
+            done_count += 1
+        lines.append(f"{mark} {title}")
+    lines.append(f"Итого: <b>{done_count}</b>/<b>{len(habits_config)}</b> выполнено")
+
     return "\n".join(lines)
 
 
@@ -966,7 +1071,7 @@ async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     log.setdefault(today.isoformat(), {})
     save_user_state(user_id, state)
     context.user_data["view_scope"] = "habits"
-    context.user_data["habits_selected_date"] = today.isoformat()
+    context.user_data["habits_selected_day"] = today.isoformat()
     context.user_data["habits_week_start"] = week_start.isoformat()
     await update.message.reply_text(
         render_habits_week(state, week_start, today),
@@ -1076,8 +1181,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "🗑 Удалить задачу",
         "🌙 Итог дня",
         "📦 Бэклог",
-        "📥 Взять из бэклога",
-        "🧹 Разобрать бэклог",
         "✅ Привычки",
         "🔔 Уведомления",
         "🗂 Бэклог",
@@ -1139,20 +1242,20 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await cmd_add(update, context)
             return
         if text == "🗑 Удалить задачу":
-            view_scope = context.user_data.get("view_scope", "day")
-            active_day = context.user_data.get("active_day") or today_str()
-            context.user_data["del_mode"] = view_scope
-            context.user_data["awaiting_del_id"] = True
-            if view_scope == "backlog":
-                await update.message.reply_text(
-                    "Введи номер задачи для удаления (Бэклог).",
-                    reply_markup=build_cancel_keyboard(),
-                )
-            else:
-                await update.message.reply_text(
-                    f"Введи номер задачи для удаления (План: {format_date_ru(active_day)})",
-                    reply_markup=build_cancel_keyboard(),
-                )
+            active_day = context.user_data.get("active_day")
+            state = load_user_state(user_id)
+            kb = build_delete_day_keyboard(state, active_day)
+            has_tasks = any(obj.get("tasks") for obj in state.get("days", {}).values())
+            if not has_tasks:
+                await update.message.reply_text("Нет задач для удаления.")
+                return
+            context.user_data["del_mode"] = "day"
+            context.user_data.pop("awaiting_del_id", None)
+            context.user_data.pop("del_day", None)
+            await update.message.reply_text(
+                "Выбери день, где удалить задачи",
+                reply_markup=kb,
+            )
             return
         if text == "🌙 Итог дня":
             await cmd_evening(update, context)
@@ -1165,7 +1268,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if not backlog:
                 await update.message.reply_text("Бэклог пуст.")
                 return
-            message = "Нажми на задачу, чтобы перенести её на день. Для удаления — 🗑 и номер."
+            message = "Нажми на задачу, чтобы перенести в план или удалить."
             message += "\n\n" + render_backlog_pick_list(backlog)
             await update.message.reply_text(
                 message,
@@ -1173,30 +1276,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 reply_markup=build_backlog_pick_keyboard(backlog),
             )
             return
-        if text == "🧹 Разобрать бэклог":
-            state = load_user_state(user_id)
-            backlog = get_backlog(state)
-            context.user_data["triage_mode"] = True
-            if not backlog:
-                await update.message.reply_text("📦 Бэклог пуст.")
-                return
-            await update.message.reply_text(
-                render_triage_list(backlog),
-                reply_markup=build_triage_keyboard(backlog),
-            )
-            return
-        if text == "📥 Взять из бэклога":
-            state = load_user_state(user_id)
-            backlog = get_backlog(state)
-            context.user_data["take_mode"] = True
-            if not backlog:
-                await update.message.reply_text("📦 Бэклог пуст.")
-                return
-            await update.message.reply_text(
-                "Выбери задачу из бэклога, чтобы добавить её в план на сегодня:",
-                reply_markup=build_backlog_take_keyboard(backlog),
-            )
-            return
+        # управление бэклогом доступно внутри экрана "📦 Бэклог"
 
     if context.user_data.get("view_date_mode"):
         iso_date = parse_date_input_ru(text)
@@ -1215,60 +1295,39 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if context.user_data.get("awaiting_del_id"):
-        try:
-            task_id = int(text)
-        except ValueError:
+        ids = parse_task_ids_input(text)
+        if not ids:
             await update.message.reply_text(
-                "Номер должен быть числом. Введи номер задачи.",
+                "Введите номер(а) задачи: 2 или 2,4,5",
                 reply_markup=build_cancel_keyboard(),
             )
             return
 
         state = load_user_state(user_id)
-        view_scope = context.user_data.get("view_scope", "day")
-        if view_scope == "backlog":
-            backlog = get_backlog(state)
-            item = find_backlog_item(backlog, task_id)
-            if not item:
-                await update.message.reply_text(
-                    f"Не нашёл задачу с номером {task_id}. Введи другой номер.",
-                    reply_markup=build_cancel_keyboard(),
-                )
-                return
-            backlog.remove(item)
-            backlog[:] = normalize_task_ids_backlog(backlog)
-            state["backlog"] = backlog
-            save_user_state(user_id, state)
-            reset_input_modes(context)
-            context.user_data["view_scope"] = "backlog"
-            await update.message.reply_text(f"🗑 Удалил задачу {task_id}) {item.get('text')}")
-            await update.message.reply_text(f"📦 Сейчас в бэклоге: {len(backlog)}")
-            await update.message.reply_text(render_backlog(backlog), parse_mode=ParseMode.HTML)
-            return
-
-        day = context.user_data.get("active_day") or today_str()
+        day = context.user_data.get("del_day") or context.user_data.get("active_day") or today_str()
         day_obj = get_day(state, day)
         if day_obj.get("closed"):
             reset_input_modes(context)
             await update.message.reply_text("День закрыт (история). Удалять нельзя.")
             return
-
-        task = find_task(day_obj, task_id)
-        if not task:
+        tasks = day_obj.get("tasks", [])
+        removed = [t for t in tasks if t.get("id") in ids]
+        if not removed:
             await update.message.reply_text(
-                f"Не нашёл задачу с номером {task_id}. Введи другой номер.",
+                "Не нашёл задачи с такими номерами. Введи другие номера.",
                 reply_markup=build_cancel_keyboard(),
             )
             return
 
-        tasks = [t for t in day_obj.get("tasks", []) if t.get("id") != task_id]
+        tasks = [t for t in tasks if t.get("id") not in ids]
         day_obj["tasks"] = normalize_task_ids(tasks)
         save_user_state(user_id, state)
         reset_input_modes(context)
         context.user_data["view_scope"] = "day"
         context.user_data["view_day"] = day
         context.user_data["active_day"] = day
-        await update.message.reply_text(f"🗑 Удалил задачу {task_id}) {task.get('text')}")
+        removed_text = ", ".join(f"{t.get('id')}) {t.get('text')}" for t in removed)
+        await update.message.reply_text(f"🗑 Удалил задачи: {removed_text}")
         reply_markup = build_today_keyboard(day_obj) if day == today_str() and not day_obj.get("closed") else None
         await update.message.reply_text(
             render_plan(day, day_obj, show_hint=bool(reply_markup)),
@@ -1301,7 +1360,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data.pop("awaiting_habit_title", None)
         today = date.today()
         week_start_iso = context.user_data.get("habits_week_start")
-        active_iso = context.user_data.get("habits_selected_date")
+        active_iso = context.user_data.get("habits_selected_day") or context.user_data.get("habits_selected_date")
         try:
             week_start = date.fromisoformat(week_start_iso) if week_start_iso else week_start_for(today)
         except Exception:
@@ -1311,7 +1370,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception:
             active_date = today
         context.user_data["habits_week_start"] = week_start.isoformat()
-        context.user_data["habits_selected_date"] = active_date.isoformat()
+        context.user_data["habits_selected_day"] = active_date.isoformat()
         await update.message.reply_text(f"✅ Добавил привычку: {title}")
         await update.message.reply_text(
             render_habits_week(state, week_start_for(active_date), active_date),
@@ -1599,6 +1658,71 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.edit_text(text_msg, reply_markup=build_notifications_keyboard(state))
         return
 
+    if data.startswith("del_pick_day:"):
+        day = data.split(":", 1)[1]
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        day_obj = get_day(state, day)
+        if not day_obj.get("tasks"):
+            await query.answer()
+            await query.message.edit_text(
+                "В этом дне нет задач.",
+                reply_markup=build_delete_day_keyboard(state, context.user_data.get("active_day")),
+            )
+            return
+        context.user_data["del_day"] = day
+        context.user_data["awaiting_del_id"] = True
+        await query.answer()
+        await query.message.edit_text(
+            f"Задачи на {format_date_ru(day)}:",
+            reply_markup=build_delete_tasks_keyboard(day, day_obj),
+        )
+        return
+
+    if data == "del_back":
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        await query.answer()
+        await query.message.edit_text(
+            "Выбери день, где удалить задачи",
+            reply_markup=build_delete_day_keyboard(state, context.user_data.get("active_day")),
+        )
+        return
+
+    if data.startswith("del_one:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await query.answer("Неверные данные.", show_alert=True)
+            return
+        day = parts[1]
+        try:
+            task_id = int(parts[2])
+        except ValueError:
+            await query.answer("Неверный номер задачи.", show_alert=True)
+            return
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        day_obj = get_day(state, day)
+        task = find_task(day_obj, task_id)
+        if not task:
+            await query.answer("Задача не найдена.", show_alert=True)
+            return
+        tasks = [t for t in day_obj.get("tasks", []) if t.get("id") != task_id]
+        day_obj["tasks"] = normalize_task_ids(tasks)
+        save_user_state(user_id, state)
+        await query.answer("Удалил.")
+        if not day_obj.get("tasks"):
+            await query.message.edit_text(
+                f"Задачи на {format_date_ru(day)} отсутствуют.",
+                reply_markup=build_delete_day_keyboard(state, context.user_data.get("active_day")),
+            )
+            return
+        await query.message.edit_text(
+            f"Задачи на {format_date_ru(day)}:",
+            reply_markup=build_delete_tasks_keyboard(day, day_obj),
+        )
+        return
+
     if data.startswith("triage:"):
         user_id = query.from_user.id
         state = load_user_state(user_id)
@@ -1697,12 +1821,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text("📦 Бэклог пуст.")
         return
 
-    if data.startswith("hab:"):
+    if data.startswith("hab:") or data.startswith("habits_day:"):
         user_id = query.from_user.id
         state = load_user_state(user_id)
         today = date.today()
         week_start_iso = context.user_data.get("habits_week_start")
-        selected_iso = context.user_data.get("habits_selected_date")
+        selected_iso = context.user_data.get("habits_selected_day") or context.user_data.get("habits_selected_date")
         try:
             week_start = date.fromisoformat(week_start_iso) if week_start_iso else None
         except Exception:
@@ -1715,15 +1839,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             week_start = week_start_for(selected_date)
 
         if data == "hab:back":
-            reset_input_modes(context)
             await query.answer()
-            await query.message.reply_text(get_start_message(), reply_markup=build_start_keyboard())
+            await query.message.edit_text(
+                render_habits_week(state, week_start, selected_date),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_habits_keyboard(state, selected_date),
+            )
             return
         if data == "hab:settings":
             context.user_data.pop("awaiting_habit_title", None)
             await query.answer()
             await query.message.edit_text(
-                render_habits_settings_text(week_start, selected_date),
+                render_habits_week(state, week_start, selected_date),
+                parse_mode=ParseMode.HTML,
                 reply_markup=build_habits_settings_keyboard(week_start, selected_date),
             )
             return
@@ -1752,7 +1880,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             save_user_state(user_id, state)
             await query.answer("Удалил привычку.")
             await query.message.edit_text(
-                render_habits_week(state, week_start_for(selected_date), selected_date),
+                render_habits_week(state, week_start, selected_date),
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_habits_keyboard(state, selected_date),
             )
@@ -1760,50 +1888,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if data == "hab:pick_day":
             await query.answer()
             await query.message.edit_text(
-                "Выбери день:",
+                render_habits_week(state, week_start, selected_date),
+                parse_mode=ParseMode.HTML,
                 reply_markup=build_habits_day_picker_keyboard(week_start),
             )
             return
         if data == "hab:week_prev":
             week_start = week_start - timedelta(days=7)
             context.user_data["habits_week_start"] = week_start.isoformat()
+            selected_date = week_start + timedelta(days=selected_date.weekday())
+            context.user_data["habits_selected_day"] = selected_date.isoformat()
             await query.answer()
             await query.message.edit_text(
-                render_habits_settings_text(week_start, selected_date),
+                render_habits_week(state, week_start, selected_date),
+                parse_mode=ParseMode.HTML,
                 reply_markup=build_habits_settings_keyboard(week_start, selected_date),
             )
             return
         if data == "hab:week_next":
             week_start = week_start + timedelta(days=7)
             context.user_data["habits_week_start"] = week_start.isoformat()
+            selected_date = week_start + timedelta(days=selected_date.weekday())
+            context.user_data["habits_selected_day"] = selected_date.isoformat()
             await query.answer()
             await query.message.edit_text(
-                render_habits_settings_text(week_start, selected_date),
+                render_habits_week(state, week_start, selected_date),
+                parse_mode=ParseMode.HTML,
                 reply_markup=build_habits_settings_keyboard(week_start, selected_date),
             )
             return
-        if data == "hab:week_today":
-            week_start = week_start_for(today)
-            context.user_data["habits_week_start"] = week_start.isoformat()
-            selected_date = today
-            context.user_data["habits_selected_date"] = selected_date.isoformat()
-            await query.answer()
-            await query.message.edit_text(
-                render_habits_week(state, week_start_for(selected_date), selected_date),
-                parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, selected_date),
-            )
-            return
-        if data.startswith("hab:day:"):
-            iso = data.split(":", 2)[2]
-            try:
-                if iso == "today":
+        if data.startswith("habits_day:"):
+            code = data.split(":", 1)[1]
+            if code == "cancel":
+                await query.answer()
+                await query.message.edit_text(
+                    render_habits_week(state, week_start, selected_date),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_habits_keyboard(state, selected_date),
+                )
+                return
+            if code == "today":
+                selected_date = today
+            else:
+                week_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+                idx = week_map.get(code)
+                if idx is None:
                     selected_date = today
                 else:
-                    selected_date = date.fromisoformat(iso)
-            except Exception:
-                selected_date = today
-            context.user_data["habits_selected_date"] = selected_date.isoformat()
+                    selected_date = week_start + timedelta(days=idx)
+            context.user_data["habits_selected_day"] = selected_date.isoformat()
             context.user_data["habits_week_start"] = week_start_for(selected_date).isoformat()
             await query.answer()
             await query.message.edit_text(
@@ -1822,7 +1955,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             save_user_state(user_id, state)
             await query.answer("Готово.")
             await query.message.edit_text(
-                render_habits_week(state, week_start_for(selected_date), selected_date),
+                render_habits_week(state, week_start, selected_date),
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_habits_keyboard(state, selected_date),
             )
@@ -2025,8 +2158,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.pop("del_mode", None)
             context.user_data.pop("awaiting_del_id", None)
             context.user_data.pop("take_mode", None)
+            user_id = query.from_user.id
+            state = load_user_state(user_id)
+            backlog = get_backlog(state)
             await query.answer()
-            await query.message.reply_text("Ок.")
+            if not backlog:
+                await query.message.reply_text("📦 Бэклог пуст.")
+            else:
+                message = "Нажми на задачу, чтобы перенести в план или удалить."
+                message += "\n\n" + render_backlog_pick_list(backlog)
+                await query.message.reply_text(
+                    message,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_backlog_pick_keyboard(backlog),
+                )
             return
 
         try:
@@ -2151,6 +2296,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer()
             await query.message.reply_text("Ок, отменил.", reply_markup=build_start_keyboard())
             return
+        if len(parts) == 2 and parts[1] == "back":
+            user_id = query.from_user.id
+            state = load_user_state(user_id)
+            backlog = get_backlog(state)
+            await query.answer()
+            if not backlog:
+                await query.message.reply_text("📦 Бэклог пуст.")
+            else:
+                message = "Нажми на задачу, чтобы перенести в план или удалить."
+                message += "\n\n" + render_backlog_pick_list(backlog)
+                await query.message.reply_text(
+                    message,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_backlog_pick_keyboard(backlog),
+                )
+            return
 
         if len(parts) != 3:
             await query.answer("Неверные данные.", show_alert=True)
@@ -2163,6 +2324,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         target = parts[2]
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+
+        if target == "delete":
+            backlog = get_backlog(state)
+            item = find_backlog_item(backlog, item_id)
+            if not item:
+                await query.answer("Задача не найдена в бэклоге.", show_alert=True)
+                return
+            backlog.remove(item)
+            backlog[:] = normalize_task_ids_backlog(backlog)
+            state["backlog"] = backlog
+            save_user_state(user_id, state)
+            await query.answer("Удалил.")
+            if backlog:
+                message = "Нажми на задачу, чтобы перенести в план или удалить."
+                message += "\n\n" + render_backlog_pick_list(backlog)
+                await query.message.reply_text(
+                    message,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_backlog_pick_keyboard(backlog),
+                )
+            else:
+                await query.message.reply_text("📦 Бэклог пуст.")
+            return
+
         if target == "date":
             context.user_data["move_mode"] = "date"
             context.user_data["move_task_id"] = item_id
@@ -2178,8 +2365,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Неверное направление.", show_alert=True)
             return
 
-        user_id = query.from_user.id
-        state = load_user_state(user_id)
         backlog = get_backlog(state)
         item = find_backlog_item(backlog, item_id)
         if not item:
