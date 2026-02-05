@@ -1,7 +1,9 @@
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import html
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +31,16 @@ DEFAULT_TASKS = [
     "5 мин итог: что понял/что повторить",
 ]
 
+HABITS_DEFAULT_CONFIG = [
+    {"key": "study", "title": "Учёба"},
+    {"key": "music", "title": "Музыка"},
+    {"key": "sport", "title": "Спорт"},
+    {"key": "reading", "title": "Чтение"},
+    {"key": "vitamin_d", "title": "Витамин D"},
+    {"key": "breathing", "title": "Дыхание"},
+    {"key": "automation", "title": "Автоматизация"},
+]
+
 BACKLOG_TTL_DAYS = 7
 
 
@@ -43,6 +55,8 @@ def tomorrow_str() -> str:
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
+DATE_INPUT_ERROR = "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026"
+
 
 def format_date_ru(value: str) -> str:
     if not value:
@@ -56,12 +70,20 @@ def format_date_ru(value: str) -> str:
         return value
 
 
-def parse_date_input(value: str) -> Optional[str]:
+def parse_date_input_ru(value: str) -> Optional[str]:
     raw = value.strip()
     if not raw:
         return None
+    parts = raw.split(".")
+    if len(parts) != 3:
+        return None
+    day_s, month_s, year_s = parts
+    if len(day_s) != 2 or len(month_s) != 2 or len(year_s) != 4:
+        return None
+    if not (day_s.isdigit() and month_s.isdigit() and year_s.isdigit()):
+        return None
     try:
-        return datetime.strptime(raw, "%d.%m.%Y").date().isoformat()
+        return date(int(year_s), int(month_s), int(day_s)).isoformat()
     except ValueError:
         return None
 
@@ -136,14 +158,11 @@ def render_plan(day: str, day_obj: Dict[str, Any], show_hint: bool = False) -> s
 def build_start_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
+            ["📌 План на сегодня", "➕ Добавить задачу"],
+            ["📦 Бэклог", "📅 План по дате"],
+            ["📥 Взять из бэклога", "🗑 Удалить задачу"],
+            ["✅ Привычки", "🌙 Итог дня"],
             ["🏠 Главная"],
-            ["📌 План на сегодня"],
-            ["📅 План по дате"],
-            ["➕ Добавить задачу"],
-            ["🗑 Удалить задачу"],
-            ["🌙 Итог дня"],
-            ["📦 Бэклог"],
-            ["📥 Взять из бэклога"],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -489,6 +508,109 @@ def render_day_preview(
     return "\n".join(lines)
 
 
+def get_habits_config(state: Dict[str, Any]) -> List[Dict[str, str]]:
+    config = state.get("habits_config")
+    if not isinstance(config, list) or not config:
+        state["habits_config"] = [dict(item) for item in HABITS_DEFAULT_CONFIG]
+        config = state["habits_config"]
+    return config
+
+
+def get_habits_log(state: Dict[str, Any]) -> Dict[str, Dict[str, bool]]:
+    log = state.get("habits_log")
+    if not isinstance(log, dict):
+        log = {}
+        state["habits_log"] = log
+    return log
+
+
+def week_dates_for(today: date) -> List[date]:
+    monday = today - timedelta(days=today.weekday())
+    return [monday + timedelta(days=i) for i in range(7)]
+
+
+def render_habits_week(state: Dict[str, Any], today: date) -> str:
+    config = get_habits_config(state)
+    log = get_habits_log(state)
+    week_dates = week_dates_for(today)
+    start_iso = week_dates[0].isoformat()
+    end_iso = week_dates[-1].isoformat()
+
+    titles = [str(h.get("title", "")) for h in config]
+    max_title = max([len(t) for t in titles] + [5])
+    day_labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    header = " " * (max_title + 1) + "  ".join(day_labels)
+
+    lines = [header]
+    for habit in config:
+        title = str(habit.get("title", ""))
+        key = str(habit.get("key", ""))
+        row = [title.ljust(max_title)]
+        for d in week_dates:
+            iso = d.isoformat()
+            mark = "✅" if log.get(iso, {}).get(key, False) else "❌"
+            row.append(mark)
+        lines.append(" ".join([row[0]] + [f"{cell:>2}" for cell in row[1:]]))
+
+    header_line = f"✅ Привычки — неделя {format_date_ru(start_iso)}–{format_date_ru(end_iso)}"
+    table = "\n".join(lines)
+    return f"{html.escape(header_line)}\n<pre>{html.escape(table)}</pre>"
+
+
+def build_habits_keyboard(state: Dict[str, Any], today: date) -> InlineKeyboardMarkup:
+    config = get_habits_config(state)
+    log = get_habits_log(state)
+    today_iso = today.isoformat()
+    rows = []
+    for habit in config:
+        key = str(habit.get("key", ""))
+        title = str(habit.get("title", ""))
+        done = log.get(today_iso, {}).get(key, False)
+        label = f"{'✅' if done else '❌'} {title}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"habit:toggle:{key}")])
+    rows.append(
+        [
+            InlineKeyboardButton("⚙️ Настроить", callback_data="habit:settings"),
+            InlineKeyboardButton("↩️ Назад", callback_data="habit:back"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_habits_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➕ Добавить привычку", callback_data="habit:add")],
+            [InlineKeyboardButton("🗑 Удалить привычку", callback_data="habit:del")],
+            [InlineKeyboardButton("↩️ Назад", callback_data="habit:back")],
+        ]
+    )
+
+
+def build_habits_delete_keyboard(config: List[Dict[str, str]]) -> InlineKeyboardMarkup:
+    rows = []
+    for habit in config:
+        key = str(habit.get("key", ""))
+        title = str(habit.get("title", ""))
+        rows.append([InlineKeyboardButton(title, callback_data=f"habit:del:{key}")])
+    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="habit:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def normalize_habit_key(title: str, existing: set[str]) -> str:
+    base = title.strip().lower()
+    base = re.sub(r"\s+", "_", base)
+    base = re.sub(r"[^a-z0-9_]", "", base)
+    if not base:
+        base = f"custom_{int(datetime.now().timestamp())}"
+    key = base
+    idx = 2
+    while key in existing:
+        key = f"{base}_{idx}"
+        idx += 1
+    return key
+
+
 def render_overdue_backlog(items: List[Dict[str, Any]]) -> str:
     lines = ["⚠️ <b>Просроченные задачи в бэклоге</b>"]
     for item in items:
@@ -634,19 +756,37 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    await update.message.reply_text(get_start_message(), reply_markup=build_start_keyboard())
+
+
+def get_start_message() -> str:
+    return (
         "Привет! Я твой PM-бот (MVP v0.1).\n\n"
         "Как пользуемся:\n"
         "1) С утра собери план на день\n"
         "2) В течение дня отмечай выполненное\n"
         "3) Вечером подведём итог и перенесём остаток\n\n"
-        "Жми кнопки ниже — это самый быстрый путь.",
-        reply_markup=build_start_keyboard(),
+        "Жми кнопки ниже — это самый быстрый путь."
     )
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Куда добавить задачу?", reply_markup=build_add_keyboard())
+
+
+async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    state = load_user_state(user_id)
+    today = date.today()
+    log = get_habits_log(state)
+    log.setdefault(today.isoformat(), {})
+    save_user_state(user_id, state)
+    context.user_data["view_scope"] = "habits"
+    await update.message.reply_text(
+        render_habits_week(state, today),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_habits_keyboard(state, today),
+    )
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -751,6 +891,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "🌙 Итог дня",
         "📦 Бэклог",
         "📥 Взять из бэклога",
+        "✅ Привычки",
         "🗂 Бэклог",
         "❌ Отмена",
     }
@@ -788,6 +929,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
         if text == "📅 План по дате":
             await update.message.reply_text("Выбери режим:", reply_markup=build_date_mode_keyboard())
+            return
+        if text == "✅ Привычки":
+            await cmd_habits(update, context)
             return
         if text == "➕ Добавить задачу":
             await cmd_add(update, context)
@@ -841,12 +985,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
 
     if context.user_data.get("view_date_mode"):
-        iso_date = parse_date_input(text)
+        iso_date = parse_date_input_ru(text)
         if not iso_date:
-            await update.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
-                reply_markup=build_cancel_keyboard(),
-            )
+            await update.message.reply_text(DATE_INPUT_ERROR, reply_markup=build_cancel_keyboard())
             return
 
         state = load_user_state(user_id)
@@ -922,13 +1063,41 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    if context.user_data.get("move_mode") == "date":
-        iso_date = parse_date_input(text)
-        if not iso_date:
+    if context.user_data.get("awaiting_habit_title"):
+        if text in button_labels:
             await update.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
+                "Сейчас добавление привычки. Пришли текст одним сообщением или нажми ❌ Отмена.",
                 reply_markup=build_cancel_keyboard(),
             )
+            return
+        title = text.strip()
+        if not title:
+            await update.message.reply_text(
+                "Название не должно быть пустым. Пришли текст одним сообщением.",
+                reply_markup=build_cancel_keyboard(),
+            )
+            return
+        state = load_user_state(user_id)
+        config = get_habits_config(state)
+        existing = {str(h.get("key", "")) for h in config}
+        key = normalize_habit_key(title, existing)
+        config.append({"key": key, "title": title})
+        state["habits_config"] = config
+        save_user_state(user_id, state)
+        context.user_data.pop("awaiting_habit_title", None)
+        today = date.today()
+        await update.message.reply_text(f"✅ Добавил привычку: {title}")
+        await update.message.reply_text(
+            render_habits_week(state, today),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_habits_keyboard(state, today),
+        )
+        return
+
+    if context.user_data.get("move_mode") == "date":
+        iso_date = parse_date_input_ru(text)
+        if not iso_date:
+            await update.message.reply_text(DATE_INPUT_ERROR, reply_markup=build_cancel_keyboard())
             return
 
         task_id = context.user_data.get("move_task_id")
@@ -967,12 +1136,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     add_mode = context.user_data.get("add_mode")
     if add_mode:
         if add_mode == "date" and not context.user_data.get("add_date"):
-            iso_date = parse_date_input(text)
+            iso_date = parse_date_input_ru(text)
             if not iso_date:
-                await update.message.reply_text(
-                    "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
-                    reply_markup=build_cancel_keyboard(),
-                )
+                await update.message.reply_text(DATE_INPUT_ERROR, reply_markup=build_cancel_keyboard())
                 return
             context.user_data["add_date"] = iso_date
             context.user_data["awaiting_task_text"] = True
@@ -1049,10 +1215,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if add_mode == "date":
             day = context.user_data.get("add_date")
             if not day:
-                await update.message.reply_text(
-                    "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
-                    reply_markup=build_cancel_keyboard(),
-                )
+                await update.message.reply_text(DATE_INPUT_ERROR, reply_markup=build_cancel_keyboard())
                 return
             day_obj = add_task_to_day(state, day, text)
             save_user_state(user_id, state)
@@ -1131,6 +1294,69 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Показаны первые 10 задач.", show_alert=True)
         return
 
+    if data.startswith("habit:"):
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        today = date.today()
+        if data == "habit:back":
+            reset_input_modes(context)
+            await query.answer()
+            await query.message.reply_text(get_start_message(), reply_markup=build_start_keyboard())
+            return
+        if data == "habit:settings":
+            context.user_data.pop("awaiting_habit_title", None)
+            await query.answer()
+            await query.message.edit_text(
+                "Настройки привычек:",
+                reply_markup=build_habits_settings_keyboard(),
+            )
+            return
+        if data == "habit:add":
+            context.user_data["awaiting_habit_title"] = True
+            await query.answer()
+            await query.message.reply_text(
+                "Напиши название привычки одним сообщением.",
+                reply_markup=build_cancel_keyboard(),
+            )
+            return
+        if data == "habit:del":
+            config = get_habits_config(state)
+            save_user_state(user_id, state)
+            await query.answer()
+            await query.message.edit_text(
+                "Выбери привычку для удаления:",
+                reply_markup=build_habits_delete_keyboard(config),
+            )
+            return
+        if data.startswith("habit:del:"):
+            key = data.split(":", 2)[2]
+            config = get_habits_config(state)
+            config = [h for h in config if str(h.get("key", "")) != key]
+            state["habits_config"] = config
+            save_user_state(user_id, state)
+            await query.answer("Удалил привычку.")
+            await query.message.edit_text(
+                render_habits_week(state, today),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_habits_keyboard(state, today),
+            )
+            return
+        if data.startswith("habit:toggle:"):
+            key = data.split(":", 2)[2]
+            log = get_habits_log(state)
+            today_iso = today.isoformat()
+            log.setdefault(today_iso, {})
+            log[today_iso][key] = not bool(log[today_iso].get(key, False))
+            state["habits_log"] = log
+            save_user_state(user_id, state)
+            await query.answer("Готово.")
+            await query.message.edit_text(
+                render_habits_week(state, today),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_habits_keyboard(state, today),
+            )
+            return
+
     if data.startswith("day:") or data.startswith("today:"):
         action = data.split(":", 1)[1]
         user_id = query.from_user.id
@@ -1170,10 +1396,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reset_input_modes(context)
             context.user_data["view_date_mode"] = True
             await query.answer()
-            await query.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
-                reply_markup=build_cancel_keyboard(),
-            )
+            await query.message.reply_text(DATE_INPUT_ERROR, reply_markup=build_cancel_keyboard())
             return
         if len(parts) == 2 and parts[1] == "list":
             user_id = query.from_user.id
@@ -1313,10 +1536,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.pop("move_task_id", None)
         await query.answer()
         if mode == "date":
-            await query.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
-                reply_markup=build_cancel_keyboard(),
-            )
+            await query.message.reply_text(DATE_INPUT_ERROR, reply_markup=build_cancel_keyboard())
         else:
             context.user_data["awaiting_task_text"] = True
             await query.message.reply_text(
@@ -1480,10 +1700,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.pop("del_mode", None)
             context.user_data.pop("awaiting_del_id", None)
             await query.answer()
-            await query.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
-                reply_markup=build_cancel_keyboard(),
-            )
+            await query.message.reply_text(DATE_INPUT_ERROR, reply_markup=build_cancel_keyboard())
             return
 
         if target not in {"today", "tomorrow"}:
