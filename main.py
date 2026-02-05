@@ -44,6 +44,32 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def format_date_display(value: str) -> str:
+    if not value:
+        return value
+    try:
+        if "T" in value:
+            dt = datetime.fromisoformat(value)
+            return dt.strftime("%d.%m.%Y")
+        return date.fromisoformat(value).strftime("%d.%m.%Y")
+    except Exception:
+        return value
+
+
+def parse_date_input(value: str) -> Optional[str]:
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw).isoformat()
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(raw, "%d.%m.%Y").date().isoformat()
+    except ValueError:
+        return None
+
+
 def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -92,7 +118,8 @@ def create_default_plan(day_obj: Dict[str, Any]) -> None:
 
 
 def render_plan(day: str, day_obj: Dict[str, Any]) -> str:
-    lines = [f"📌 <b>План на {day}</b>"]
+    display_day = format_date_display(day)
+    lines = [f"📌 <b>План на {display_day}</b>"]
     if day_obj.get("closed"):
         lines.append("⚠️ День закрыт (история).")
         return "\n".join(lines)
@@ -111,7 +138,7 @@ def render_plan(day: str, day_obj: Dict[str, Any]) -> str:
 
 def build_start_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["📌 План на сегодня"], ["➕ Добавить задачу"], ["🌙 Итог дня"], ["🗂 Бэклог"]],
+        [["📌 План на сегодня"], ["➕ Добавить задачу"], ["🌙 Итог дня"], ["📦 Бэклог"]],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -289,21 +316,31 @@ def maybe_pull_from_backlog(state: Dict[str, Any], day_obj: Dict[str, Any]) -> O
 
 def render_backlog(backlog: List[Dict[str, Any]]) -> str:
     if not backlog:
-        return "🗂 Бэклог пуст."
+        return "📦 Бэклог пуст."
 
-    lines = ["🗂 <b>Бэклог</b>"]
-    for item in sorted(backlog, key=backlog_sort_key):
-        created_at = str(item.get("created_at", ""))[:10]
-        lines.append(f"<b>{item.get('id')})</b> {item.get('text')} ({created_at})")
+    lines = [f"📦 <b>Бэклог</b> ({len(backlog)} задач)"]
+    lines.append("")
+    for item in backlog[:20]:
+        lines.append(f"{item.get('id')}) {item.get('text')}")
+    return "\n".join(lines)
+
+
+def render_backlog_tail(backlog: List[Dict[str, Any]], limit: int = 3) -> str:
+    if not backlog:
+        return "📦 Бэклог пуст."
+    items = backlog[-limit:]
+    lines = ["Последние задачи:"]
+    for item in items:
+        lines.append(f"{item.get('id')}) {item.get('text')}")
     return "\n".join(lines)
 
 
 def render_day_preview(day: str, day_obj: Dict[str, Any], limit: int = 3) -> str:
     tasks: List[Dict[str, Any]] = day_obj.get("tasks", [])
     if not tasks:
-        return f"План на {day} пока пуст."
+        return f"План на {format_date_display(day)} пока пуст."
 
-    lines = [f"Первые задачи на {day}:"]
+    lines = [f"Первые задачи на {format_date_display(day)}:"]
     for t in tasks[:limit]:
         lines.append(f"{t.get('id')}) {t.get('text')}")
     return "\n".join(lines)
@@ -312,7 +349,7 @@ def render_day_preview(day: str, day_obj: Dict[str, Any], limit: int = 3) -> str
 def render_overdue_backlog(items: List[Dict[str, Any]]) -> str:
     lines = ["⚠️ <b>Просроченные задачи в бэклоге</b>"]
     for item in items:
-        created_at = str(item.get("created_at", ""))[:10]
+        created_at = format_date_display(str(item.get("created_at", "")))
         lines.append(f"<b>{item.get('id')})</b> {item.get('text')} ({created_at})")
     lines.append("\nВыбери действие:")
     return "\n".join(lines)
@@ -423,7 +460,7 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
 
     # Ответ
     lines = [
-        f"🌙 <b>Итог дня {day}</b>",
+        f"🌙 <b>Итог дня {format_date_display(day)}</b>",
         f"Сделано: <b>{len(done_tasks)}</b> / <b>{len(tasks)}</b>",
         "",
         "<b>✅ Выполнено:</b>" if done_tasks else "<b>✅ Выполнено:</b> —",
@@ -446,7 +483,7 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
         for t in backlog_items:
             lines.append(f"🗂 {t.get('text')}")
 
-    lines += ["", f"📌 <b>Черновик на завтра ({tmr}):</b>"]
+    lines += ["", f"📌 <b>Черновик на завтра ({format_date_display(tmr)}):</b>"]
     for t in tomorrow_obj["tasks"]:
         lines.append(f"⬜ <b>{t['id']})</b> {t['text']}")
 
@@ -560,12 +597,13 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     add_mode = context.user_data.get("add_mode")
     if add_mode:
         if add_mode == "date" and not context.user_data.get("add_date"):
-            try:
-                date.fromisoformat(text)
-            except ValueError:
-                await update.message.reply_text("Введите дату в формате YYYY-MM-DD, например 2026-02-05")
+            iso_date = parse_date_input(text)
+            if not iso_date:
+                await update.message.reply_text(
+                    "Введите дату в формате YYYY-MM-DD или DD.MM.YYYY, например 2026-02-05"
+                )
                 return
-            context.user_data["add_date"] = text
+            context.user_data["add_date"] = iso_date
             await update.message.reply_text("Напиши текст задачи одним сообщением.")
             return
 
@@ -588,20 +626,26 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             save_user_state(user_id, state)
             context.user_data.pop("add_mode", None)
             context.user_data.pop("add_date", None)
-            await update.message.reply_text(f"✅ Добавил задачу на {day}: {text}")
-            await update.message.reply_text(render_day_preview(day, day_obj))
+            await update.message.reply_text(
+                f"✅ Добавил задачу на {format_date_display(day)}: {text}"
+            )
+            await update.message.reply_text(render_plan(day, day_obj), parse_mode=ParseMode.HTML)
             return
         if add_mode == "date":
             day = context.user_data.get("add_date")
             if not day:
-                await update.message.reply_text("Введите дату в формате YYYY-MM-DD, например 2026-02-05")
+                await update.message.reply_text(
+                    "Введите дату в формате YYYY-MM-DD или DD.MM.YYYY, например 2026-02-05"
+                )
                 return
             day_obj = add_task_to_day(state, day, text)
             save_user_state(user_id, state)
             context.user_data.pop("add_mode", None)
             context.user_data.pop("add_date", None)
-            await update.message.reply_text(f"✅ Добавил задачу на {day}: {text}")
-            await update.message.reply_text(render_day_preview(day, day_obj))
+            await update.message.reply_text(
+                f"✅ Добавил задачу на {format_date_display(day)}: {text}"
+            )
+            await update.message.reply_text(render_plan(day, day_obj), parse_mode=ParseMode.HTML)
             return
         if add_mode == "backlog":
             backlog = get_backlog(state)
@@ -623,10 +667,11 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data.pop("add_mode", None)
             context.user_data.pop("add_date", None)
             await update.message.reply_text(f"✅ Добавил в бэклог: {text}")
-            await update.message.reply_text(f"В бэклоге сейчас {len(backlog)} задач(и).")
+            await update.message.reply_text(f"📦 Сейчас в бэклоге: {len(backlog)}")
+            await update.message.reply_text(render_backlog_tail(backlog))
             return
 
-    button_labels = {"📌 План на сегодня", "➕ Добавить задачу", "🌙 Итог дня", "🗂 Бэклог"}
+    button_labels = {"📌 План на сегодня", "➕ Добавить задачу", "🌙 Итог дня", "📦 Бэклог", "🗂 Бэклог"}
 
     if text and text not in button_labels:
         state = load_user_state(user_id)
@@ -657,7 +702,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await cmd_add(update, context)
     elif text == "🌙 Итог дня":
         await cmd_evening(update, context)
-    elif text == "🗂 Бэклог":
+    elif text in {"📦 Бэклог", "🗂 Бэклог"}:
         state = load_user_state(user_id)
         backlog = get_backlog(state)
         await update.message.reply_text(render_backlog(backlog), parse_mode=ParseMode.HTML)
@@ -705,7 +750,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.pop("add_date", None)
         await query.answer()
         if mode == "date":
-            await query.message.reply_text("Введите дату в формате YYYY-MM-DD, например 2026-02-05")
+            await query.message.reply_text(
+                "Введите дату в формате YYYY-MM-DD или DD.MM.YYYY, например 2026-02-05"
+            )
         else:
             await query.message.reply_text("Напиши текст задачи одним сообщением.")
         return
