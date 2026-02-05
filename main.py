@@ -140,6 +140,7 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
             ["🗑 Удалить задачу"],
             ["🌙 Итог дня"],
             ["📦 Бэклог"],
+            ["❌ Отмена"],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -380,6 +381,15 @@ def build_move_keyboard(item_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("del_mode", None)
+    context.user_data.pop("awaiting_del_id", None)
+    context.user_data.pop("add_mode", None)
+    context.user_data.pop("add_date", None)
+    context.user_data.pop("move_mode", None)
+    context.user_data.pop("move_task_id", None)
+
+
 def render_day_preview(
     day: str, day_obj: Dict[str, Any], limit: int = 3, include_text: Optional[str] = None
 ) -> str:
@@ -568,6 +578,8 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     day = today_str()
     day_obj = get_day(state, day)
+    context.user_data["view_scope"] = "day"
+    context.user_data["view_day"] = day
 
     if day_obj.get("closed"):
         # если вдруг закрыто — создадим новый день заново (редко)
@@ -649,6 +661,63 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     user_id = update.effective_user.id
 
+    button_labels = {
+        "📌 План на сегодня",
+        "➕ Добавить задачу",
+        "🗑 Удалить задачу",
+        "🌙 Итог дня",
+        "📦 Бэклог",
+        "🗂 Бэклог",
+        "❌ Отмена",
+    }
+
+    if text in button_labels:
+        reset_input_modes(context)
+        state = load_user_state(user_id)
+        if "backlog_edit" in state:
+            state.pop("backlog_edit", None)
+            save_user_state(user_id, state)
+
+        if text == "❌ Отмена":
+            await update.message.reply_text("Отменил.")
+            return
+        if text == "📌 План на сегодня":
+            await cmd_today(update, context)
+            return
+        if text == "➕ Добавить задачу":
+            await cmd_add(update, context)
+            return
+        if text == "🗑 Удалить задачу":
+            view_scope = context.user_data.get("view_scope", "day")
+            view_day = context.user_data.get("view_day") or today_str()
+            context.user_data["del_mode"] = view_scope
+            context.user_data["awaiting_del_id"] = True
+            if view_scope == "backlog":
+                await update.message.reply_text("Введи номер задачи для удаления (Бэклог).")
+            else:
+                await update.message.reply_text(
+                    f"Введи номер задачи для удаления (План: {format_date_ru(view_day)})"
+                )
+            return
+        if text == "🌙 Итог дня":
+            await cmd_evening(update, context)
+            return
+        if text in {"📦 Бэклог", "🗂 Бэклог"}:
+            state = load_user_state(user_id)
+            backlog = get_backlog(state)
+            context.user_data["view_scope"] = "backlog"
+            if not backlog:
+                await update.message.reply_text("Бэклог пуст.")
+                return
+            message = render_backlog_pick_list(backlog)
+            message += "\n\nЧтобы удалить: нажми 🗑 Удалить задачу и введи номер."
+            await update.message.reply_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_backlog_pick_keyboard(backlog),
+            )
+            return
+
     if context.user_data.get("awaiting_del_id"):
         try:
             task_id = int(text)
@@ -657,12 +726,31 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
 
         state = load_user_state(user_id)
-        day = today_str()
+        view_scope = context.user_data.get("view_scope", "day")
+        if view_scope == "backlog":
+            backlog = get_backlog(state)
+            item = find_backlog_item(backlog, task_id)
+            if not item:
+                await update.message.reply_text(f"Не нашёл задачу с номером {task_id}. Введи другой номер.")
+                return
+            backlog.remove(item)
+            backlog[:] = normalize_task_ids_backlog(backlog)
+            state["backlog"] = backlog
+            save_user_state(user_id, state)
+            reset_input_modes(context)
+            context.user_data["view_scope"] = "backlog"
+            await update.message.reply_text(f"🗑 Удалил задачу {task_id}) {item.get('text')}")
+            await update.message.reply_text(f"📦 Сейчас в бэклоге: {len(backlog)}")
+            await update.message.reply_text(render_backlog(backlog), parse_mode=ParseMode.HTML)
+            return
+
+        day = context.user_data.get("view_day") or today_str()
         day_obj = get_day(state, day)
         if day_obj.get("closed"):
-            context.user_data.pop("del_mode", None)
-            context.user_data.pop("awaiting_del_id", None)
-            await update.message.reply_text("Сегодняшний день уже закрыт. Напиши /today чтобы начать новый план.")
+            reset_input_modes(context)
+            await update.message.reply_text(
+                "Этот день закрыт. Перейти к плану на сегодня? Нажми 📌 План на сегодня."
+            )
             return
 
         task = find_task(day_obj, task_id)
@@ -673,8 +761,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         tasks = [t for t in day_obj.get("tasks", []) if t.get("id") != task_id]
         day_obj["tasks"] = normalize_task_ids(tasks)
         save_user_state(user_id, state)
-        context.user_data.pop("del_mode", None)
-        context.user_data.pop("awaiting_del_id", None)
+        reset_input_modes(context)
+        context.user_data["view_scope"] = "day"
+        context.user_data["view_day"] = day
         await update.message.reply_text(f"🗑 Удалил задачу {task_id}) {task.get('text')}")
         await update.message.reply_text(
             render_plan(day, day_obj),
@@ -715,6 +804,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         save_user_state(user_id, state)
         context.user_data.pop("move_mode", None)
         context.user_data.pop("move_task_id", None)
+        context.user_data["view_scope"] = "day"
+        context.user_data["view_day"] = day
         await update.message.reply_text(
             f"✅ Перенёс на {format_date_ru(day)}: {item.get('text')}"
         )
@@ -741,6 +832,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             save_user_state(user_id, state)
             context.user_data.pop("add_mode", None)
             context.user_data.pop("add_date", None)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
             await update.message.reply_text(
                 render_plan(day, day_obj),
                 parse_mode=ParseMode.HTML,
@@ -753,6 +846,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             save_user_state(user_id, state)
             context.user_data.pop("add_mode", None)
             context.user_data.pop("add_date", None)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
             await update.message.reply_text(
                 f"✅ Добавил задачу на {format_date_ru(day)}: {text}"
             )
@@ -769,6 +864,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             save_user_state(user_id, state)
             context.user_data.pop("add_mode", None)
             context.user_data.pop("add_date", None)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
             await update.message.reply_text(
                 f"✅ Добавил задачу на {format_date_ru(day)}: {text}"
             )
@@ -793,68 +890,33 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             save_user_state(user_id, state)
             context.user_data.pop("add_mode", None)
             context.user_data.pop("add_date", None)
+            context.user_data["view_scope"] = "backlog"
             await update.message.reply_text(f"✅ Добавил в бэклог: {text}")
             await update.message.reply_text(f"📦 Сейчас в бэклоге: {len(backlog)}")
             await update.message.reply_text(render_backlog_tail(backlog))
             return
 
-    button_labels = {
-        "📌 План на сегодня",
-        "➕ Добавить задачу",
-        "🗑 Удалить задачу",
-        "🌙 Итог дня",
-        "📦 Бэклог",
-        "🗂 Бэклог",
-    }
+    state = load_user_state(user_id)
+    pending = state.get("backlog_edit")
+    if isinstance(pending, dict) and pending.get("id") is not None:
+        try:
+            item_id = int(pending.get("id"))
+        except Exception:
+            item_id = None
 
-    if text and text not in button_labels:
-        state = load_user_state(user_id)
-        pending = state.get("backlog_edit")
-        if isinstance(pending, dict) and pending.get("id") is not None:
-            try:
-                item_id = int(pending.get("id"))
-            except Exception:
-                item_id = None
-
-            backlog = get_backlog(state)
-            item = find_backlog_item(backlog, item_id) if item_id is not None else None
-            state.pop("backlog_edit", None)
-            if item:
-                item["text"] = text
-                item["last_seen_at"] = now_iso()
-                save_user_state(user_id, state)
-                await update.message.reply_text("✂️ Обновил формулировку.")
-                await update.message.reply_text(render_backlog(backlog), parse_mode=ParseMode.HTML)
-            else:
-                save_user_state(user_id, state)
-                await update.message.reply_text("Не нашёл задачу в бэклоге.")
-            return
-
-    if text == "📌 План на сегодня":
-        await cmd_today(update, context)
-    elif text == "➕ Добавить задачу":
-        await cmd_add(update, context)
-    elif text == "🗑 Удалить задачу":
-        context.user_data["del_mode"] = "today"
-        context.user_data["awaiting_del_id"] = True
-        context.user_data.pop("add_mode", None)
-        context.user_data.pop("add_date", None)
-        context.user_data.pop("move_mode", None)
-        context.user_data.pop("move_task_id", None)
-        await update.message.reply_text("Введи номер задачи для удаления (сегодняшний план).")
-    elif text == "🌙 Итог дня":
-        await cmd_evening(update, context)
-    elif text in {"📦 Бэклог", "🗂 Бэклог"}:
-        state = load_user_state(user_id)
         backlog = get_backlog(state)
-        if not backlog:
-            await update.message.reply_text("Бэклог пуст.")
-            return
-        await update.message.reply_text(
-            render_backlog_pick_list(backlog),
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_backlog_pick_keyboard(backlog),
-        )
+        item = find_backlog_item(backlog, item_id) if item_id is not None else None
+        state.pop("backlog_edit", None)
+        if item:
+            item["text"] = text
+            item["last_seen_at"] = now_iso()
+            save_user_state(user_id, state)
+            await update.message.reply_text("✂️ Обновил формулировку.")
+            await update.message.reply_text(render_backlog(backlog), parse_mode=ParseMode.HTML)
+        else:
+            save_user_state(user_id, state)
+            await update.message.reply_text("Не нашёл задачу в бэклоге.")
+        return
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -874,6 +936,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         state = load_user_state(user_id)
         day = today_str()
         day_obj = get_day(state, day)
+        context.user_data["view_scope"] = "day"
+        context.user_data["view_day"] = day
 
         ok, message = apply_done(day_obj, task_id)
         if not ok:
@@ -1004,6 +1068,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         save_user_state(user_id, state)
         context.user_data.pop("move_mode", None)
         context.user_data.pop("move_task_id", None)
+        context.user_data["view_scope"] = "day"
+        context.user_data["view_day"] = day
         await query.answer()
         if target == "today":
             await query.message.reply_text(
