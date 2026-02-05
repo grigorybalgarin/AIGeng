@@ -70,6 +70,18 @@ def format_date_ru(value: str) -> str:
         return value
 
 
+def format_date_ru_short(value: str) -> str:
+    if not value:
+        return value
+    try:
+        if "T" in value:
+            dt = datetime.fromisoformat(value)
+            return dt.strftime("%d.%m")
+        return date.fromisoformat(value).strftime("%d.%m")
+    except Exception:
+        return value
+
+
 def parse_date_input_ru(value: str) -> Optional[str]:
     raw = value.strip()
     if not raw:
@@ -100,7 +112,12 @@ def user_file(user_id: int) -> Path:
 def load_user_state(user_id: int) -> Dict[str, Any]:
     path = user_file(user_id)
     if not path.exists():
-        return {"user_id": user_id, "created_at": now_iso(), "days": {}}
+        return {
+            "user_id": user_id,
+            "created_at": now_iso(),
+            "days": {},
+            "settings": {"notifications_enabled": True},
+        }
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -161,9 +178,9 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
             ["📌 План на сегодня", "✅ Привычки"],
             ["➕ Добавить задачу", "📦 Бэклог"],
             ["🗑 Удалить задачу", "📅 План по дате"],
-            ["📋 Отчёт дня", "🔔 Тест уведомления"],
+            ["📋 Отчёт дня", "🧪 Тест уведомления"],
             ["🔔 Уведомления", "📊 Статистика"],
-            ["🏠 Главная"],
+            ["💬 Обратная связь", "🏠 Главная"],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -598,6 +615,8 @@ def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("habits_selected_day", None)
     context.user_data.pop("habits_week_start", None)
     context.user_data.pop("habits_screen", None)
+    context.user_data.pop("feedback_mode", None)
+    context.user_data.pop("feedback_text", None)
 
 
 def render_day_preview(
@@ -717,85 +736,54 @@ def week_dates_for(start: date) -> List[date]:
 
 def render_habits_week(state: Dict[str, Any], week_start: date, selected_date: date) -> str:
     config = get_habits_config(state)
-    log = get_habits_log(state)
     week_dates = week_dates_for(week_start)
     start_iso = week_dates[0].isoformat()
     end_iso = week_dates[-1].isoformat()
 
-    name_w = 16
-    cell_w = 4
-    gap = " "
     day_labels = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
     selected_idx = None
     if week_dates[0] <= selected_date <= week_dates[-1]:
         selected_idx = (selected_date - week_dates[0]).days
-    def fmt_cell(text: str) -> str:
-        return f"{text:^{cell_w}}"
-
-    header_cells = []
-    for idx, label in enumerate(day_labels):
-        cell_text = f"[{label}]" if selected_idx == idx else label
-        header_cells.append(fmt_cell(cell_text))
-    header = " " * (name_w + 1) + gap.join(header_cells)
-
-    lines = [header]
-    for habit in config:
-        title = sanitize_habit_name(str(habit.get("title", "")))
-        if len(title) > name_w:
-            title = title[: name_w - 1].rstrip() + "…"
-        key = str(habit.get("key", ""))
-        row_cells = []
-        for d in week_dates:
-            iso = d.isoformat()
-            day_log = log.get(iso, {}) if isinstance(log.get(iso, {}), dict) else {}
-            mark = habit_mark(day_log.get(key))
-            row_cells.append(fmt_cell(mark))
-        line = f"{title.ljust(name_w)} " + gap.join(row_cells)
-        lines.append(line)
-
-    header_line = f"Привычки: {format_date_ru(start_iso)}–{format_date_ru(end_iso)}"
     selected_label = day_labels[selected_idx] if selected_idx is not None else "--"
-    edit_line = f"Выбран день: {selected_label} ({format_date_ru(selected_date.isoformat())})"
-    table = "\n".join(lines)
-    hint = "Нажми на привычку, чтобы отметить за выбранный день."
-    return (
-        f"{html.escape(header_line)}\n{html.escape(edit_line)}\n"
-        f"<pre>{html.escape(table)}</pre>\n{html.escape(hint)}"
+    header_line = (
+        f"✅ Привычки | Неделя {format_date_ru_short(start_iso)}–{format_date_ru_short(end_iso)}"
+        f" | выбран: {selected_label.capitalize()}"
     )
+    lines = [html.escape(header_line), ""]
+    for i, habit in enumerate(config, start=1):
+        title = html.escape(sanitize_habit_name(str(habit.get("title", ""))))
+        lines.append(f"{i}) {title}")
+    return "\n".join(lines)
 
 
-def build_habits_keyboard(state: Dict[str, Any], selected_date: date) -> InlineKeyboardMarkup:
+def build_habits_keyboard(state: Dict[str, Any], week_start: date) -> InlineKeyboardMarkup:
     config = get_habits_config(state)
     log = get_habits_log(state)
-    selected_iso = selected_date.isoformat()
+    week_dates = week_dates_for(week_start)
+    day_labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     rows = []
     for habit in config:
         key = str(habit.get("key", ""))
-        title = sanitize_habit_name(str(habit.get("title", "")))
-        day_log = log.get(selected_iso, {}) if isinstance(log.get(selected_iso, {}), dict) else {}
-        mark = habit_mark(day_log.get(key))
-        label = f"{mark} {title}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"hab:toggle:{key}")])
+        row = []
+        for label, day_date in zip(day_labels, week_dates):
+            iso = day_date.isoformat()
+            day_log = log.get(iso, {}) if isinstance(log.get(iso, {}), dict) else {}
+            mark = habit_mark(day_log.get(key))
+            row.append(InlineKeyboardButton(f"{label} {mark}", callback_data=f"hab:toggle:{key}:{iso}"))
+        rows.append(row)
     rows.append(
         [
-            InlineKeyboardButton("📅 Выбрать день", callback_data="hab:pick_day"),
             InlineKeyboardButton("⚙️ Настроить", callback_data="hab:settings"),
+            InlineKeyboardButton("🏠 Главная", callback_data="hab:home"),
         ]
     )
-    rows.append(
-        [
-            InlineKeyboardButton("◀️ Неделя", callback_data="hab:week_prev"),
-            InlineKeyboardButton("▶️ Неделя", callback_data="hab:week_next"),
-        ]
-    )
-    rows.append([InlineKeyboardButton("🏠 Главная", callback_data="hab:home")])
     return InlineKeyboardMarkup(rows)
 
 
 def build_habits_settings_keyboard(week_start: date, selected_date: date) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📅 Выбрать день", callback_data="hab:pick_day")],
+            [InlineKeyboardButton("📅 Выбрать день/неделю", callback_data="hab:pick_day")],
             [
                 InlineKeyboardButton("⬅️ Неделя -1", callback_data="hab:week_prev"),
                 InlineKeyboardButton("➡️ Неделя +1", callback_data="hab:week_next"),
@@ -864,9 +852,24 @@ def get_notifications(state: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def get_settings(state: Dict[str, Any]) -> Dict[str, Any]:
+    settings = state.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+        state["settings"] = settings
+    return settings
+
+
+def notifications_enabled(state: Dict[str, Any]) -> bool:
+    settings = state.get("settings")
+    if isinstance(settings, dict) and "notifications_enabled" in settings:
+        return bool(settings.get("notifications_enabled"))
+    return True
+
+
 def build_notifications_keyboard(state: Dict[str, Any]) -> InlineKeyboardMarkup:
     cfg = get_notifications(state)
-    enabled = bool(cfg.get("enabled"))
+    enabled = notifications_enabled(state)
     toggle_label = "❌ Выключить" if enabled else "✅ Включить"
     return InlineKeyboardMarkup(
         [
@@ -901,7 +904,7 @@ def schedule_notifications(
     remove_jobs(job_queue, f"notify_evening_{user_id}")
 
     cfg = get_notifications(state)
-    if not cfg.get("enabled"):
+    if not notifications_enabled(state):
         return
 
     morning_time = parse_time_hhmm(str(cfg.get("morning", "09:00")))
@@ -922,6 +925,22 @@ def schedule_notifications(
         )
 
 
+async def send_notification(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    state: Dict[str, Any],
+    reply_markup: Optional[ReplyKeyboardMarkup] = None,
+    notify_on_disabled: bool = True,
+) -> bool:
+    if not notifications_enabled(state):
+        if notify_on_disabled:
+            await context.bot.send_message(chat_id=chat_id, text="🔕 Уведомления выключены.")
+        return False
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    return True
+
+
 def has_any_habit_done(state: Dict[str, Any], date_iso: str) -> bool:
     log = get_habits_log(state)
     day_log = log.get(date_iso)
@@ -933,13 +952,18 @@ def has_any_habit_done(state: Dict[str, Any], date_iso: str) -> bool:
 async def notify_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data or {}
     chat_id = data.get("chat_id")
-    if not chat_id:
+    user_id = data.get("user_id")
+    if not chat_id or not user_id:
         return
+    state = load_user_state(int(user_id))
     reply_kb = ReplyKeyboardMarkup([["📌 План на сегодня"]], resize_keyboard=True, one_time_keyboard=False)
-    await context.bot.send_message(
+    await send_notification(
+        context,
         chat_id=chat_id,
         text="Доброе утро! Готов собрать план на сегодня?",
+        state=state,
         reply_markup=reply_kb,
+        notify_on_disabled=False,
     )
 
 
@@ -954,22 +978,30 @@ async def notify_evening(context: ContextTypes.DEFAULT_TYPE) -> None:
     if has_any_habit_done(state, today_iso):
         return
     reply_kb = ReplyKeyboardMarkup([["✅ Привычки"]], resize_keyboard=True, one_time_keyboard=False)
-    await context.bot.send_message(
+    await send_notification(
+        context,
         chat_id=chat_id,
         text="Вечерний чек‑ин: отметь привычки за сегодня.",
+        state=state,
         reply_markup=reply_kb,
+        notify_on_disabled=False,
     )
 
 
 async def notify_test(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data or {}
     chat_id = data.get("chat_id")
-    if not chat_id:
+    user_id = data.get("user_id")
+    if not chat_id or not user_id:
         return
+    state = load_user_state(int(user_id))
     stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
-    await context.bot.send_message(
+    await send_notification(
+        context,
         chat_id=chat_id,
         text=f"🔔 Тест уведомления: работает ({stamp})",
+        state=state,
+        notify_on_disabled=False,
     )
 
 
@@ -1211,7 +1243,7 @@ def build_evening_report(state: Dict[str, Any], day: str, day_obj: Dict[str, Any
         mark = habit_mark(day_log.get(key)) if key in day_log else "⬜"
         if state_val != "none":
             lines.append(f"{mark} {title}")
-    lines.append(f"Привычки: 🟩 {done_count}, 🟥 {skip_count} (не считая ⬜)")
+    lines.append(f"Привычки: 🟩 {done_count}, 🟥 {skip_count}")
 
     return "\n".join(lines)
 
@@ -1250,7 +1282,7 @@ async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         render_habits_week(state, week_start, today),
         parse_mode=ParseMode.HTML,
-        reply_markup=build_habits_keyboard(state, today),
+        reply_markup=build_habits_keyboard(state, week_start),
     )
 
 
@@ -1273,22 +1305,23 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     days_count = len(days)
 
     week_start = week_start_for(date.today())
-    h_done, h_skip, h_none = habits_week_stats(state, week_start)
-    marked = h_done + h_skip
-    percent = round((h_done / marked) * 100) if marked else 0
+    h_done, h_skip, _ = habits_week_stats(state, week_start)
+    habits_config = get_habits_config(state)
+    habits_count = len(habits_config)
 
     lines = [
         "📊 <b>Статистика</b>",
         f"Сегодня: всего {total_tasks} / ✅ {done_tasks} / ⬜ {todo_tasks}",
         f"Дней в истории: {days_count}",
         f"Бэклог: {len(backlog)}",
-        f"Привычки (неделя): 🟩 {h_done}, 🟥 {h_skip}, ⬜ {h_none}, ✅ {percent}%",
+        f"Привычки (неделя): всего {habits_count}, 🟩 {h_done}, 🟥 {h_skip}",
     ]
 
-    feedback = state.get("feedback")
-    if feedback is not None:
-        total_fb, yes_fb, no_fb = feedback_counts(feedback)
-        lines.append(f"Отзывы: всего {total_fb} (👍 {yes_fb}, 👎 {no_fb})")
+    stats = state.get("feedback_stats")
+    ok_count = int(stats.get("ok", 0) or 0) if isinstance(stats, dict) else 0
+    anon_count = int(stats.get("anon", 0) or 0) if isinstance(stats, dict) else 0
+    total_fb = ok_count + anon_count
+    lines.append(f"Отзывы: всего {total_fb} (✅ {ok_count}, 🙈 {anon_count})")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -1398,6 +1431,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "✅ Привычки",
         "🔔 Уведомления",
         "🔔 Тест уведомления",
+        "🧪 Тест уведомления",
+        "💬 Обратная связь",
         "📊 Статистика",
         "🗂 Бэклог",
         "❌ Отмена",
@@ -1415,6 +1450,13 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if text == "❌ Отмена":
         reset_input_modes(context)
         await update.message.reply_text("Ок, отменил.", reply_markup=build_start_keyboard())
+        return
+
+    if context.user_data.get("feedback_mode") == "awaiting_text" and text in button_labels:
+        await update.message.reply_text(
+            "Сейчас отзыв. Пришли текст одним сообщением или нажми ❌ Отмена.",
+            reply_markup=build_cancel_keyboard(),
+        )
         return
 
     if context.user_data.get("awaiting_task_text") and text in button_labels:
@@ -1440,22 +1482,41 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if text == "✅ Привычки":
             await cmd_habits(update, context)
             return
-        if text == "🔔 Тест уведомления":
+        if text in {"🔔 Тест уведомления", "🧪 Тест уведомления"}:
+            state = load_user_state(user_id)
             now_stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
-            await update.message.reply_text(f"🔔 Тест уведомления: работает ({now_stamp})")
+            await send_notification(
+                context,
+                chat_id=update.effective_chat.id,
+                text=f"🔔 Тест уведомления: работает ({now_stamp})",
+                state=state,
+            )
             return
         if text == "🔔 Уведомления":
             state = load_user_state(user_id)
             cfg = get_notifications(state)
             save_user_state(user_id, state)
             text_msg = (
-                f"🔔 Уведомления: {'включены' if cfg.get('enabled') else 'выключены'}\n"
+                f"🔔 Уведомления: {'включены' if notifications_enabled(state) else 'выключены'}\n"
                 f"Утро: {cfg.get('morning')}\n"
                 f"Вечер: {cfg.get('evening')}"
             )
             await update.message.reply_text(
                 text_msg,
                 reply_markup=build_notifications_keyboard(state),
+            )
+            return
+        if text == "💬 Обратная связь":
+            admin_ids = get_admin_ids()
+            if not admin_ids:
+                await update.message.reply_text("⚠️ Отзывы временно недоступны.")
+                return
+            reset_input_modes(context)
+            context.user_data["feedback_mode"] = "awaiting_text"
+            context.user_data.pop("feedback_text", None)
+            await update.message.reply_text(
+                "Напиши отзыв одним сообщением. Можно баг, идею или что непонятно.",
+                reply_markup=build_cancel_keyboard(),
             )
             return
         if text == "📊 Статистика":
@@ -1500,6 +1561,26 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return
         # управление бэклогом доступно внутри экрана "📦 Бэклог"
+
+    if context.user_data.get("feedback_mode") == "awaiting_text":
+        if text in button_labels:
+            await update.message.reply_text(
+                "Сейчас отзыв. Пришли текст одним сообщением или нажми ❌ Отмена.",
+                reply_markup=build_cancel_keyboard(),
+            )
+            return
+        context.user_data["feedback_text"] = text
+        context.user_data["feedback_mode"] = "awaiting_followup"
+        await update.message.reply_text(
+            "Хочешь, чтобы я мог уточнять вопросы по твоему отзыву?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("✅ Да", callback_data="fb:ok")],
+                    [InlineKeyboardButton("🙈 Пусть будет полностью анонимно", callback_data="fb:anon")],
+                ]
+            ),
+        )
+        return
 
     if context.user_data.get("view_date_mode"):
         iso_date = parse_date_input_ru(text)
@@ -1593,10 +1674,11 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["habits_week_start"] = week_start.isoformat()
         context.user_data["habits_selected_day"] = active_date.isoformat()
         await update.message.reply_text(f"✅ Добавил привычку: {title}")
+        week_start = week_start_for(active_date)
         await update.message.reply_text(
-            render_habits_week(state, week_start_for(active_date), active_date),
+            render_habits_week(state, week_start, active_date),
             parse_mode=ParseMode.HTML,
-            reply_markup=build_habits_keyboard(state, active_date),
+            reply_markup=build_habits_keyboard(state, week_start),
         )
         return
 
@@ -1834,6 +1916,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "noop":
         await query.answer("Показаны первые 10 задач.", show_alert=True)
         return
+    if data.startswith("fb:"):
+        user_id = query.from_user.id
+        admin_ids = get_admin_ids()
+        if not admin_ids:
+            reset_input_modes(context)
+            await query.answer()
+            await query.message.reply_text("⚠️ Отзывы временно недоступны.")
+            return
+        feedback_text = context.user_data.get("feedback_text")
+        if not feedback_text:
+            reset_input_modes(context)
+            await query.answer("Не нашёл текст отзыва.", show_alert=True)
+            return
+        can_follow_up = data == "fb:ok"
+        state = load_user_state(user_id)
+        stats = state.get("feedback_stats")
+        if not isinstance(stats, dict):
+            stats = {"ok": 0, "anon": 0}
+        key = "ok" if can_follow_up else "anon"
+        stats[key] = int(stats.get(key, 0) or 0) + 1
+        state["feedback_stats"] = stats
+        save_user_state(user_id, state)
+
+        user = query.from_user
+        stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
+        username = f"@{user.username}" if user.username else "-"
+        admin_text = (
+            "💬 Отзыв\n"
+            f"Время: {stamp}\n"
+            f"can_follow_up: {'yes' if can_follow_up else 'no'}\n"
+            f"user_id: {user.id}\n"
+            f"username: {username}\n"
+            f"first_name: {user.first_name}\n"
+            f"Текст: {feedback_text}"
+        )
+        for admin_id in admin_ids:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=admin_text)
+            except Exception:
+                continue
+
+        reset_input_modes(context)
+        await query.answer()
+        if can_follow_up:
+            await query.message.reply_text("Спасибо! Принято ✅ Если понадобится — уточню.")
+        else:
+            await query.message.reply_text("Спасибо! Принято ✅ (анонимно)")
+        return
     if data.startswith("habit:"):
         data = "hab:" + data.split("habit:", 1)[1]
 
@@ -1841,6 +1971,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_id = query.from_user.id
         state = load_user_state(user_id)
         cfg = get_notifications(state)
+        settings = get_settings(state)
         chat_id = query.message.chat_id if query.message else query.from_user.id
         if data == "notif:back":
             reset_input_modes(context)
@@ -1848,7 +1979,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text(get_start_message(), reply_markup=build_start_keyboard())
             return
         if data == "notif:toggle":
-            cfg["enabled"] = not bool(cfg.get("enabled"))
+            current = notifications_enabled(state)
+            settings["notifications_enabled"] = not current
+            state["settings"] = settings
+            cfg["enabled"] = settings["notifications_enabled"]
             state["notifications"] = cfg
             save_user_state(user_id, state)
             schedule_notifications(context, user_id, chat_id, state)
@@ -1867,7 +2001,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Вечернее уведомление: 21:30")
 
         text_msg = (
-            f"🔔 Уведомления: {'включены' if cfg.get('enabled') else 'выключены'}\n"
+            f"🔔 Уведомления: {'включены' if notifications_enabled(state) else 'выключены'}\n"
             f"Утро: {cfg.get('morning')}\n"
             f"Вечер: {cfg.get('evening')}"
         )
@@ -2066,7 +2200,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.edit_text(
                 render_habits_week(state, week_start, selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, selected_date),
+                reply_markup=build_habits_keyboard(state, week_start),
             )
             return
         if data == "hab:settings":
@@ -2106,7 +2240,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.edit_text(
                 render_habits_week(state, week_start, selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, selected_date),
+                reply_markup=build_habits_keyboard(state, week_start),
             )
             return
         if data == "hab:pick_day":
@@ -2126,7 +2260,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup = (
                 build_habits_settings_keyboard(week_start, selected_date)
                 if habits_screen == "settings"
-                else build_habits_keyboard(state, selected_date)
+                else build_habits_keyboard(state, week_start)
             )
             await query.answer()
             await query.message.edit_text(
@@ -2143,7 +2277,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup = (
                 build_habits_settings_keyboard(week_start, selected_date)
                 if habits_screen == "settings"
-                else build_habits_keyboard(state, selected_date)
+                else build_habits_keyboard(state, week_start)
             )
             await query.answer()
             await query.message.edit_text(
@@ -2160,7 +2294,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await query.message.edit_text(
                     render_habits_week(state, week_start, selected_date),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=build_habits_keyboard(state, selected_date),
+                    reply_markup=build_habits_keyboard(state, week_start),
                 )
                 return
             week_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -2176,13 +2310,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.edit_text(
                 render_habits_week(state, week_start_for(selected_date), selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, selected_date),
+                reply_markup=build_habits_keyboard(state, week_start_for(selected_date)),
             )
             return
         if data.startswith("hab:toggle:"):
-            key = data.split(":", 2)[2]
+            parts = data.split(":")
+            key = parts[2] if len(parts) > 2 else ""
+            iso_override = parts[3] if len(parts) > 3 else None
             log = get_habits_log(state)
-            selected_iso = selected_date.isoformat()
+            selected_iso = iso_override or selected_date.isoformat()
             log.setdefault(selected_iso, {})
             next_value = habit_next_value(log[selected_iso].get(key))
             if next_value is None:
@@ -2196,7 +2332,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.edit_text(
                 render_habits_week(state, week_start, selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, selected_date),
+                reply_markup=build_habits_keyboard(state, week_start),
             )
             return
 
