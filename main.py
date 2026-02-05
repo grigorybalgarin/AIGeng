@@ -159,10 +159,10 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📌 План на сегодня", "➕ Добавить задачу"],
-            ["📦 Бэклог", "📅 План по дате"],
-            ["📥 Взять из бэклога", "🗑 Удалить задачу"],
-            ["✅ Привычки", "🔔 Уведомления"],
-            ["🌙 Итог дня"],
+            ["📦 Бэклог", "🧹 Разобрать бэклог"],
+            ["📥 Взять из бэклога", "📅 План по дате"],
+            ["🗑 Удалить задачу", "✅ Привычки"],
+            ["🔔 Уведомления", "🌙 Итог дня"],
             ["🏠 Главная"],
         ],
         resize_keyboard=True,
@@ -416,6 +416,41 @@ def shorten_text(text: str, max_len: int = 32) -> str:
     return text[: max_len - 1].rstrip() + "…"
 
 
+def get_triage_items(backlog: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
+    return sorted(backlog, key=backlog_sort_key)[:limit]
+
+
+def render_triage_list(backlog: List[Dict[str, Any]], limit: int = 3) -> str:
+    if not backlog:
+        return "📦 Бэклог пуст."
+    items = get_triage_items(backlog, limit)
+    lines = ["🧹 Разобрать бэклог:"]
+    for item in items:
+        lines.append(f"{item.get('id')}) {item.get('text')}")
+    return "\n".join(lines)
+
+
+def build_triage_keyboard(backlog: List[Dict[str, Any]], limit: int = 3) -> InlineKeyboardMarkup:
+    rows = []
+    items = get_triage_items(backlog, limit)
+    for item in items:
+        label = shorten_text(str(item.get("text", "")), 34)
+        rows.append([InlineKeyboardButton(label, callback_data=f"triage:{item.get('id')}")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="triage:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_triage_to_keyboard(item_id: int, include_today: bool = True) -> InlineKeyboardMarkup:
+    rows = []
+    if include_today:
+        rows.append([InlineKeyboardButton("Сегодня", callback_data=f"triage_to:today:{item_id}")])
+    rows.append([InlineKeyboardButton("Завтра", callback_data=f"triage_to:tomorrow:{item_id}")])
+    rows.append([InlineKeyboardButton("Выбрать дату", callback_data=f"triage_to:date:{item_id}")])
+    rows.append([InlineKeyboardButton("Удалить", callback_data=f"triage_to:delete:{item_id}")])
+    rows.append([InlineKeyboardButton("Назад", callback_data="triage:back")])
+    return InlineKeyboardMarkup(rows)
+
+
 def render_backlog_pick_list(backlog: List[Dict[str, Any]], limit: int = 10) -> str:
     if not backlog:
         return "Бэклог пуст."
@@ -483,11 +518,14 @@ def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("view_date_mode", None)
     context.user_data.pop("pending_add_text", None)
     context.user_data.pop("take_mode", None)
+    context.user_data.pop("triage_mode", None)
+    context.user_data.pop("triage_date_mode", None)
+    context.user_data.pop("triage_task_id", None)
     context.user_data.pop("view_scope", None)
     context.user_data.pop("view_day", None)
     context.user_data.pop("active_day", None)
     context.user_data.pop("awaiting_habit_title", None)
-    context.user_data.pop("habits_active_date", None)
+    context.user_data.pop("habits_selected_date", None)
     context.user_data.pop("habits_week_start", None)
 
 
@@ -536,7 +574,7 @@ def week_dates_for(start: date) -> List[date]:
     return [start + timedelta(days=i) for i in range(7)]
 
 
-def render_habits_week(state: Dict[str, Any], week_start: date, active_date: date) -> str:
+def render_habits_week(state: Dict[str, Any], week_start: date, selected_date: date) -> str:
     config = get_habits_config(state)
     log = get_habits_log(state)
     week_dates = week_dates_for(week_start)
@@ -545,7 +583,7 @@ def render_habits_week(state: Dict[str, Any], week_start: date, active_date: dat
 
     titles = [str(h.get("title", "")) for h in config]
     max_title = max([len(t) for t in titles] + [5])
-    day_labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    day_labels = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
     header = " " * (max_title + 1) + "".join(f"{d} " for d in day_labels)
 
     lines = [header]
@@ -556,50 +594,28 @@ def render_habits_week(state: Dict[str, Any], week_start: date, active_date: dat
         for d in week_dates:
             iso = d.isoformat()
             day_log = log.get(iso, {}) if isinstance(log.get(iso, {}), dict) else {}
-            if key not in day_log:
-                mark = "⬜"
-            else:
-                mark = "🟩" if day_log.get(key, False) else "🟥"
+            mark = "🟩" if day_log.get(key, False) else "🟥"
             row.append(f"{mark} ")
         lines.append(f"{row[0]} " + "".join(row[1:]))
 
     header_line = f"✅ Привычки — неделя {format_date_ru(start_iso)}–{format_date_ru(end_iso)}"
-    edit_line = f"Редактирую: {format_date_ru(active_date.isoformat())}"
+    edit_line = f"Выбран день: {format_date_ru(selected_date.isoformat())}"
     table = "\n".join(lines)
-    return f"{html.escape(header_line)}\n{html.escape(edit_line)}\n<pre>{html.escape(table)}</pre>"
+    hint = "Нажми на привычку, чтобы отметить за выбранный день."
+    return f"{html.escape(header_line)}\n{html.escape(edit_line)}\n<pre>{html.escape(table)}</pre>\n{html.escape(hint)}"
 
 
-def build_habits_keyboard(
-    state: Dict[str, Any], week_start: date, active_date: date
-) -> InlineKeyboardMarkup:
+def build_habits_keyboard(state: Dict[str, Any], selected_date: date) -> InlineKeyboardMarkup:
     config = get_habits_config(state)
     log = get_habits_log(state)
-    active_iso = active_date.isoformat()
+    selected_iso = selected_date.isoformat()
     rows = []
     for habit in config:
         key = str(habit.get("key", ""))
         title = str(habit.get("title", ""))
-        done = log.get(active_iso, {}).get(key, False)
-        label = f"{'✅' if done else '❌'} {title}"
+        done = log.get(selected_iso, {}).get(key, False)
+        label = f"{'🟩' if done else '🟥'} {title}"
         rows.append([InlineKeyboardButton(label, callback_data=f"hab:toggle:{key}")])
-
-    rows.append(
-        [
-            InlineKeyboardButton("◀️ Неделя", callback_data="hab:week_prev"),
-            InlineKeyboardButton("Сегодня", callback_data="hab:week_today"),
-            InlineKeyboardButton("▶️ Неделя", callback_data="hab:week_next"),
-        ]
-    )
-
-    week_dates = week_dates_for(week_start)
-    day_labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-    day_buttons = []
-    for label, d in zip(day_labels, week_dates):
-        iso = d.isoformat()
-        day_buttons.append(InlineKeyboardButton(label, callback_data=f"hab:day:{iso}"))
-    rows.append(day_buttons[:4])
-    rows.append(day_buttons[4:])
-
     rows.append(
         [
             InlineKeyboardButton("⚙️ Настроить", callback_data="hab:settings"),
@@ -609,9 +625,14 @@ def build_habits_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def build_habits_settings_keyboard() -> InlineKeyboardMarkup:
+def build_habits_settings_keyboard(week_start: date, selected_date: date) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("📅 Выбрать день", callback_data="hab:pick_day")],
+            [
+                InlineKeyboardButton("⬅️ Неделя -1", callback_data="hab:week_prev"),
+                InlineKeyboardButton("➡️ Неделя +1", callback_data="hab:week_next"),
+            ],
             [InlineKeyboardButton("➕ Добавить привычку", callback_data="hab:add")],
             [InlineKeyboardButton("🗑 Удалить привычку", callback_data="hab:del")],
             [InlineKeyboardButton("↩️ Назад", callback_data="hab:back")],
@@ -627,6 +648,28 @@ def build_habits_delete_keyboard(config: List[Dict[str, str]]) -> InlineKeyboard
         rows.append([InlineKeyboardButton(title, callback_data=f"hab:del:{key}")])
     rows.append([InlineKeyboardButton("↩️ Назад", callback_data="hab:back")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_habits_day_picker_keyboard(week_start: date) -> InlineKeyboardMarkup:
+    week_dates = week_dates_for(week_start)
+    day_labels = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
+    buttons = []
+    for label, d in zip(day_labels, week_dates):
+        buttons.append(InlineKeyboardButton(label, callback_data=f"hab:day:{d.isoformat()}"))
+    rows = [buttons[:4], buttons[4:]]
+    rows.append([InlineKeyboardButton("Сегодня", callback_data="hab:day:today")])
+    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="hab:settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def render_habits_settings_text(week_start: date, selected_date: date) -> str:
+    start_iso = week_start.isoformat()
+    end_iso = (week_start + timedelta(days=6)).isoformat()
+    return (
+        "Настройки привычек\n"
+        f"Неделя: {format_date_ru(start_iso)}–{format_date_ru(end_iso)}\n"
+        f"Выбран день: {format_date_ru(selected_date.isoformat())}"
+    )
 
 
 def normalize_habit_key(title: str, existing: set[str]) -> str:
@@ -923,12 +966,12 @@ async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     log.setdefault(today.isoformat(), {})
     save_user_state(user_id, state)
     context.user_data["view_scope"] = "habits"
-    context.user_data["habits_active_date"] = today.isoformat()
+    context.user_data["habits_selected_date"] = today.isoformat()
     context.user_data["habits_week_start"] = week_start.isoformat()
     await update.message.reply_text(
         render_habits_week(state, week_start, today),
         parse_mode=ParseMode.HTML,
-        reply_markup=build_habits_keyboard(state, week_start, today),
+        reply_markup=build_habits_keyboard(state, today),
     )
 
 
@@ -1034,6 +1077,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "🌙 Итог дня",
         "📦 Бэклог",
         "📥 Взять из бэклога",
+        "🧹 Разобрать бэклог",
         "✅ Привычки",
         "🔔 Уведомления",
         "🗂 Бэклог",
@@ -1127,6 +1171,18 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 message,
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_backlog_pick_keyboard(backlog),
+            )
+            return
+        if text == "🧹 Разобрать бэклог":
+            state = load_user_state(user_id)
+            backlog = get_backlog(state)
+            context.user_data["triage_mode"] = True
+            if not backlog:
+                await update.message.reply_text("📦 Бэклог пуст.")
+                return
+            await update.message.reply_text(
+                render_triage_list(backlog),
+                reply_markup=build_triage_keyboard(backlog),
             )
             return
         if text == "📥 Взять из бэклога":
@@ -1245,7 +1301,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data.pop("awaiting_habit_title", None)
         today = date.today()
         week_start_iso = context.user_data.get("habits_week_start")
-        active_iso = context.user_data.get("habits_active_date")
+        active_iso = context.user_data.get("habits_selected_date")
         try:
             week_start = date.fromisoformat(week_start_iso) if week_start_iso else week_start_for(today)
         except Exception:
@@ -1255,13 +1311,53 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception:
             active_date = today
         context.user_data["habits_week_start"] = week_start.isoformat()
-        context.user_data["habits_active_date"] = active_date.isoformat()
+        context.user_data["habits_selected_date"] = active_date.isoformat()
         await update.message.reply_text(f"✅ Добавил привычку: {title}")
         await update.message.reply_text(
-            render_habits_week(state, week_start, active_date),
+            render_habits_week(state, week_start_for(active_date), active_date),
             parse_mode=ParseMode.HTML,
-            reply_markup=build_habits_keyboard(state, week_start, active_date),
+            reply_markup=build_habits_keyboard(state, active_date),
         )
+        return
+
+    if context.user_data.get("triage_date_mode"):
+        iso_date = parse_date_input_ru(text)
+        if not iso_date:
+            await update.message.reply_text(DATE_INPUT_ERROR, reply_markup=build_cancel_keyboard())
+            return
+        task_id = context.user_data.get("triage_task_id")
+        if not task_id:
+            context.user_data.pop("triage_date_mode", None)
+            context.user_data.pop("triage_task_id", None)
+            await update.message.reply_text("Не нашёл задачу для переноса.")
+            return
+
+        state = load_user_state(user_id)
+        backlog = get_backlog(state)
+        item = find_backlog_item(backlog, int(task_id))
+        if not item:
+            context.user_data.pop("triage_date_mode", None)
+            context.user_data.pop("triage_task_id", None)
+            await update.message.reply_text("Не нашёл задачу в бэклоге.")
+            return
+
+        day_obj = add_task_to_day(state, iso_date, item.get("text"))
+        backlog.remove(item)
+        backlog[:] = normalize_task_ids_backlog(backlog)
+        state["backlog"] = backlog
+        save_user_state(user_id, state)
+        context.user_data.pop("triage_date_mode", None)
+        context.user_data.pop("triage_task_id", None)
+        await update.message.reply_text(
+            f"✅ Перенёс на {format_date_ru(iso_date)}: {item.get('text')}"
+        )
+        if backlog:
+            await update.message.reply_text(
+                render_triage_list(backlog),
+                reply_markup=build_triage_keyboard(backlog),
+            )
+        else:
+            await update.message.reply_text("📦 Бэклог пуст.")
         return
 
     if context.user_data.get("move_mode") == "date":
@@ -1503,20 +1599,120 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.edit_text(text_msg, reply_markup=build_notifications_keyboard(state))
         return
 
+    if data.startswith("triage:"):
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        backlog = get_backlog(state)
+        if data == "triage:cancel":
+            reset_input_modes(context)
+            await query.answer()
+            await query.message.reply_text("Ок, отменил.", reply_markup=build_start_keyboard())
+            return
+        if data == "triage:back":
+            await query.answer()
+            if not backlog:
+                await query.message.reply_text("📦 Бэклог пуст.")
+            else:
+                await query.message.reply_text(
+                    render_triage_list(backlog),
+                    reply_markup=build_triage_keyboard(backlog),
+                )
+            return
+        try:
+            item_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("Неверный номер задачи.", show_alert=True)
+            return
+        item = find_backlog_item(backlog, item_id)
+        if not item:
+            await query.answer("Задача не найдена в бэклоге.", show_alert=True)
+            return
+        await query.answer()
+        await query.message.reply_text(
+            f"Задача: {item.get('text')}\nКуда её поставить?",
+            reply_markup=build_triage_to_keyboard(item_id, include_today=True),
+        )
+        return
+
+    if data.startswith("triage_to:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await query.answer("Неверные данные.", show_alert=True)
+            return
+        target = parts[1]
+        try:
+            item_id = int(parts[2])
+        except ValueError:
+            await query.answer("Неверный номер задачи.", show_alert=True)
+            return
+
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        backlog = get_backlog(state)
+        item = find_backlog_item(backlog, item_id)
+        if not item:
+            await query.answer("Задача не найдена в бэклоге.", show_alert=True)
+            return
+
+        if target == "date":
+            context.user_data["triage_date_mode"] = True
+            context.user_data["triage_task_id"] = item_id
+            await query.answer()
+            await query.message.reply_text(DATE_INPUT_ERROR, reply_markup=build_cancel_keyboard())
+            return
+
+        if target == "delete":
+            backlog.remove(item)
+            backlog[:] = normalize_task_ids_backlog(backlog)
+            state["backlog"] = backlog
+            save_user_state(user_id, state)
+            await query.answer("Удалил.")
+            await query.message.reply_text(f"🗑 Удалил задачу: {item.get('text')}")
+        else:
+            day = today_str() if target == "today" else tomorrow_str()
+            day_obj = get_day(state, day)
+            if target == "today" and day_obj.get("closed"):
+                await query.answer("Сегодня закрыт. Выбери другую дату.", show_alert=True)
+                await query.message.reply_text(
+                    "Сегодня закрыт. Выбери другую дату.",
+                    reply_markup=build_triage_to_keyboard(item_id, include_today=False),
+                )
+                return
+            add_task_to_day(state, day, item.get("text"))
+            backlog.remove(item)
+            backlog[:] = normalize_task_ids_backlog(backlog)
+            state["backlog"] = backlog
+            save_user_state(user_id, state)
+            await query.answer()
+            await query.message.reply_text(
+                f"✅ Перенёс на {format_date_ru(day)}: {item.get('text')}"
+            )
+
+        if backlog:
+            await query.message.reply_text(
+                render_triage_list(backlog),
+                reply_markup=build_triage_keyboard(backlog),
+            )
+        else:
+            await query.message.reply_text("📦 Бэклог пуст.")
+        return
+
     if data.startswith("hab:"):
         user_id = query.from_user.id
         state = load_user_state(user_id)
         today = date.today()
         week_start_iso = context.user_data.get("habits_week_start")
-        active_iso = context.user_data.get("habits_active_date")
+        selected_iso = context.user_data.get("habits_selected_date")
         try:
-            week_start = date.fromisoformat(week_start_iso) if week_start_iso else week_start_for(today)
+            week_start = date.fromisoformat(week_start_iso) if week_start_iso else None
         except Exception:
-            week_start = week_start_for(today)
+            week_start = None
         try:
-            active_date = date.fromisoformat(active_iso) if active_iso else today
+            selected_date = date.fromisoformat(selected_iso) if selected_iso else today
         except Exception:
-            active_date = today
+            selected_date = today
+        if not week_start:
+            week_start = week_start_for(selected_date)
 
         if data == "hab:back":
             reset_input_modes(context)
@@ -1527,8 +1723,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.pop("awaiting_habit_title", None)
             await query.answer()
             await query.message.edit_text(
-                "Настройки привычек:",
-                reply_markup=build_habits_settings_keyboard(),
+                render_habits_settings_text(week_start, selected_date),
+                reply_markup=build_habits_settings_keyboard(week_start, selected_date),
             )
             return
         if data == "hab:add":
@@ -1556,76 +1752,79 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             save_user_state(user_id, state)
             await query.answer("Удалил привычку.")
             await query.message.edit_text(
-                render_habits_week(state, week_start, active_date),
+                render_habits_week(state, week_start_for(selected_date), selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, week_start, active_date),
+                reply_markup=build_habits_keyboard(state, selected_date),
+            )
+            return
+        if data == "hab:pick_day":
+            await query.answer()
+            await query.message.edit_text(
+                "Выбери день:",
+                reply_markup=build_habits_day_picker_keyboard(week_start),
             )
             return
         if data == "hab:week_prev":
             week_start = week_start - timedelta(days=7)
             context.user_data["habits_week_start"] = week_start.isoformat()
-            offset = active_date.weekday()
-            active_date = week_start + timedelta(days=offset)
-            context.user_data["habits_active_date"] = active_date.isoformat()
             await query.answer()
             await query.message.edit_text(
-                render_habits_week(state, week_start, active_date),
-                parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, week_start, active_date),
+                render_habits_settings_text(week_start, selected_date),
+                reply_markup=build_habits_settings_keyboard(week_start, selected_date),
             )
             return
         if data == "hab:week_next":
             week_start = week_start + timedelta(days=7)
             context.user_data["habits_week_start"] = week_start.isoformat()
-            offset = active_date.weekday()
-            active_date = week_start + timedelta(days=offset)
-            context.user_data["habits_active_date"] = active_date.isoformat()
             await query.answer()
             await query.message.edit_text(
-                render_habits_week(state, week_start, active_date),
-                parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, week_start, active_date),
+                render_habits_settings_text(week_start, selected_date),
+                reply_markup=build_habits_settings_keyboard(week_start, selected_date),
             )
             return
         if data == "hab:week_today":
             week_start = week_start_for(today)
-            active_date = today
             context.user_data["habits_week_start"] = week_start.isoformat()
-            context.user_data["habits_active_date"] = active_date.isoformat()
+            selected_date = today
+            context.user_data["habits_selected_date"] = selected_date.isoformat()
             await query.answer()
             await query.message.edit_text(
-                render_habits_week(state, week_start, active_date),
+                render_habits_week(state, week_start_for(selected_date), selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, week_start, active_date),
+                reply_markup=build_habits_keyboard(state, selected_date),
             )
             return
         if data.startswith("hab:day:"):
             iso = data.split(":", 2)[2]
             try:
-                active_date = date.fromisoformat(iso)
+                if iso == "today":
+                    selected_date = today
+                else:
+                    selected_date = date.fromisoformat(iso)
             except Exception:
-                active_date = today
-            context.user_data["habits_active_date"] = active_date.isoformat()
+                selected_date = today
+            context.user_data["habits_selected_date"] = selected_date.isoformat()
+            context.user_data["habits_week_start"] = week_start_for(selected_date).isoformat()
             await query.answer()
             await query.message.edit_text(
-                render_habits_week(state, week_start, active_date),
+                render_habits_week(state, week_start_for(selected_date), selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, week_start, active_date),
+                reply_markup=build_habits_keyboard(state, selected_date),
             )
             return
         if data.startswith("hab:toggle:"):
             key = data.split(":", 2)[2]
             log = get_habits_log(state)
-            active_iso = active_date.isoformat()
-            log.setdefault(active_iso, {})
-            log[active_iso][key] = not bool(log[active_iso].get(key, False))
+            selected_iso = selected_date.isoformat()
+            log.setdefault(selected_iso, {})
+            log[selected_iso][key] = not bool(log[selected_iso].get(key, False))
             state["habits_log"] = log
             save_user_state(user_id, state)
             await query.answer("Готово.")
             await query.message.edit_text(
-                render_habits_week(state, week_start, active_date),
+                render_habits_week(state, week_start_for(selected_date), selected_date),
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_habits_keyboard(state, week_start, active_date),
+                reply_markup=build_habits_keyboard(state, selected_date),
             )
             return
 
