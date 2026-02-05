@@ -141,6 +141,7 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
             ["🗑 Удалить задачу"],
             ["🌙 Итог дня"],
             ["📦 Бэклог"],
+            ["📥 Взять из бэклога"],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -148,15 +149,17 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_today_keyboard(day_obj: Dict[str, Any]) -> InlineKeyboardMarkup:
+    if day_obj.get("closed"):
+        return InlineKeyboardMarkup([])
     rows = []
     tasks = day_obj.get("tasks", [])
-    todo_tasks = [t for t in tasks if t.get("status") != "done"]
+    todo_tasks = [t for t in tasks if t.get("status") == "todo"]
     for t in todo_tasks[:10]:
         task_id = t.get("id")
-        label = f"✅ {shorten_text(str(t.get('text', '')), 34)}"
+        label = f"⬜ {task_id}. {shorten_text(str(t.get('text', '')), 34)}"
         rows.append([InlineKeyboardButton(label, callback_data=f"done:{task_id}")])
     if len(todo_tasks) > 10:
-        rows.append([InlineKeyboardButton("…ещё", callback_data="noop")])
+        rows.append([InlineKeyboardButton("...ещё", callback_data="noop")])
     rows.append([InlineKeyboardButton("🌙 Итог дня", callback_data="evening")])
     return InlineKeyboardMarkup(rows)
 
@@ -182,6 +185,36 @@ def build_add_today_closed_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("Завтра", callback_data="add:tomorrow")],
             [InlineKeyboardButton("Открыть новый день", callback_data="add:reopen_today")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+    )
+
+
+def build_today_closed_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Открыть новый день", callback_data="today:reopen")],
+            [InlineKeyboardButton("Показать завтра", callback_data="today:tomorrow_preview")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+    )
+
+
+def build_backlog_take_keyboard(backlog: List[Dict[str, Any]], limit: int = 5) -> InlineKeyboardMarkup:
+    rows = []
+    items = sorted(backlog, key=backlog_sort_key)[:limit]
+    for item in items:
+        label = shorten_text(str(item.get("text", "")), 36)
+        rows.append([InlineKeyboardButton(label, callback_data=f"pick:{item.get('id')}")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_pick_to_keyboard(item_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Завтра", callback_data=f"pick_to:tomorrow:{item_id}")],
+            [InlineKeyboardButton("Открыть новый день", callback_data=f"pick_to:reopen_today:{item_id}")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
         ]
     )
@@ -426,6 +459,7 @@ def reset_input_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("move_task_id", None)
     context.user_data.pop("view_date_mode", None)
     context.user_data.pop("pending_add_text", None)
+    context.user_data.pop("take_mode", None)
 
 
 def render_day_preview(
@@ -617,7 +651,18 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     day_obj = get_day(state, day)
     context.user_data["view_scope"] = "day"
     context.user_data["view_day"] = day
-    if not day_obj.get("closed") and not day_obj.get("tasks"):
+    context.user_data["active_day"] = day
+
+    if day_obj.get("closed"):
+        save_user_state(user_id, state)
+        await update.message.reply_text(
+            render_plan(day, day_obj),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_today_closed_keyboard(),
+        )
+        return
+
+    if not day_obj.get("tasks"):
         create_default_plan(day_obj)
 
     save_user_state(user_id, state)
@@ -699,6 +744,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "🗑 Удалить задачу",
         "🌙 Итог дня",
         "📦 Бэклог",
+        "📥 Взять из бэклога",
         "🗂 Бэклог",
         "❌ Отмена",
     }
@@ -724,7 +770,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
         if text == "🗑 Удалить задачу":
             view_scope = context.user_data.get("view_scope", "day")
-            view_day = context.user_data.get("view_day") or today_str()
+            active_day = context.user_data.get("active_day") or today_str()
             context.user_data["del_mode"] = view_scope
             context.user_data["awaiting_del_id"] = True
             if view_scope == "backlog":
@@ -734,7 +780,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 )
             else:
                 await update.message.reply_text(
-                    f"Введи номер задачи для удаления (План: {format_date_ru(view_day)})",
+                    f"Введи номер задачи для удаления (План: {format_date_ru(active_day)})",
                     reply_markup=build_cancel_keyboard(),
                 )
             return
@@ -745,6 +791,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             state = load_user_state(user_id)
             backlog = get_backlog(state)
             context.user_data["view_scope"] = "backlog"
+            context.user_data["take_mode"] = False
             if not backlog:
                 await update.message.reply_text("Бэклог пуст.")
                 return
@@ -754,6 +801,18 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 message,
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_backlog_pick_keyboard(backlog),
+            )
+            return
+        if text == "📥 Взять из бэклога":
+            state = load_user_state(user_id)
+            backlog = get_backlog(state)
+            context.user_data["take_mode"] = True
+            if not backlog:
+                await update.message.reply_text("📦 Бэклог пуст.")
+                return
+            await update.message.reply_text(
+                "Выбери задачу из бэклога, чтобы добавить её в план на сегодня:",
+                reply_markup=build_backlog_take_keyboard(backlog),
             )
             return
 
@@ -772,6 +831,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data.pop("view_date_mode", None)
         context.user_data["view_scope"] = "day"
         context.user_data["view_day"] = iso_date
+        context.user_data["active_day"] = iso_date
         await update.message.reply_text(render_plan(iso_date, day_obj), parse_mode=ParseMode.HTML)
         return
 
@@ -807,13 +867,11 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(render_backlog(backlog), parse_mode=ParseMode.HTML)
             return
 
-        day = context.user_data.get("view_day") or today_str()
+        day = context.user_data.get("active_day") or today_str()
         day_obj = get_day(state, day)
         if day_obj.get("closed"):
             reset_input_modes(context)
-            await update.message.reply_text(
-                "Этот день закрыт. Перейти к плану на сегодня? Нажми 📌 План на сегодня."
-            )
+            await update.message.reply_text("День закрыт (история). Удалять нельзя.")
             return
 
         task = find_task(day_obj, task_id)
@@ -830,11 +888,13 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         reset_input_modes(context)
         context.user_data["view_scope"] = "day"
         context.user_data["view_day"] = day
+        context.user_data["active_day"] = day
         await update.message.reply_text(f"🗑 Удалил задачу {task_id}) {task.get('text')}")
+        reply_markup = build_today_keyboard(day_obj) if day == today_str() and not day_obj.get("closed") else None
         await update.message.reply_text(
             render_plan(day, day_obj),
             parse_mode=ParseMode.HTML,
-            reply_markup=build_today_keyboard(day_obj),
+            reply_markup=reply_markup,
         )
         return
 
@@ -842,7 +902,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         iso_date = parse_date_input(text)
         if not iso_date:
             await update.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 08.02.2026",
+                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
                 reply_markup=build_cancel_keyboard(),
             )
             return
@@ -873,6 +933,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data.pop("move_task_id", None)
         context.user_data["view_scope"] = "day"
         context.user_data["view_day"] = day
+        context.user_data["active_day"] = day
         await update.message.reply_text(
             f"✅ Перенёс на {format_date_ru(day)}: {item.get('text')}"
         )
@@ -917,6 +978,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data.pop("pending_add_text", None)
             context.user_data["view_scope"] = "day"
             context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
             await update.message.reply_text(
                 render_plan(day, day_obj),
                 parse_mode=ParseMode.HTML,
@@ -934,6 +996,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data.pop("add_date", None)
             context.user_data["view_scope"] = "day"
             context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
             await update.message.reply_text(
                 render_plan(day, day_obj),
                 parse_mode=ParseMode.HTML,
@@ -948,6 +1011,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data.pop("add_date", None)
             context.user_data["view_scope"] = "day"
             context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
             await update.message.reply_text(
                 f"✅ Добавил задачу на {format_date_ru(day)}: {text}"
             )
@@ -967,6 +1031,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data.pop("add_date", None)
             context.user_data["view_scope"] = "day"
             context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
             await update.message.reply_text(
                 f"✅ Добавил задачу на {format_date_ru(day)}: {text}"
             )
@@ -1035,6 +1100,39 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Показаны первые 10 задач.", show_alert=True)
         return
 
+    if data.startswith("today:"):
+        action = data.split(":", 1)[1]
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        day = today_str()
+        day_obj = get_day(state, day)
+        if action == "reopen":
+            day_obj["closed"] = False
+            day_obj.pop("closed_at", None)
+            if not day_obj.get("tasks"):
+                create_default_plan(day_obj)
+            save_user_state(user_id, state)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
+            await query.answer()
+            await query.message.reply_text(
+                render_plan(day, day_obj),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_today_keyboard(day_obj),
+            )
+            return
+        if action == "tomorrow_preview":
+            tmr = tomorrow_str()
+            tmr_obj = get_day(state, tmr)
+            save_user_state(user_id, state)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = tmr
+            context.user_data["active_day"] = tmr
+            await query.answer()
+            await query.message.reply_text(render_plan(tmr, tmr_obj), parse_mode=ParseMode.HTML)
+            return
+
     if data.startswith("date:"):
         parts = data.split(":")
         if len(parts) == 2 and parts[1] == "input":
@@ -1042,7 +1140,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["view_date_mode"] = True
             await query.answer()
             await query.message.reply_text(
-                "Введи дату в формате ДД.ММ.ГГГГ",
+                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
                 reply_markup=build_cancel_keyboard(),
             )
             return
@@ -1077,15 +1175,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             save_user_state(user_id, state)
             context.user_data["view_scope"] = "day"
             context.user_data["view_day"] = iso
+            context.user_data["active_day"] = iso
             await query.answer()
-            if iso == today_str() and not day_obj.get("closed"):
-                await query.message.reply_text(
-                    render_plan(iso, day_obj),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=build_today_keyboard(day_obj),
-                )
-            else:
-                await query.message.reply_text(render_plan(iso, day_obj), parse_mode=ParseMode.HTML)
+            await query.message.reply_text(render_plan(iso, day_obj), parse_mode=ParseMode.HTML)
             return
 
 
@@ -1102,6 +1194,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         day_obj = get_day(state, day)
         context.user_data["view_scope"] = "day"
         context.user_data["view_day"] = day
+        context.user_data["active_day"] = day
+
+        if day_obj.get("closed"):
+            await query.answer("Сегодня закрыт. Нажми «Открыть новый день».", show_alert=True)
+            return
 
         ok, message = apply_done(day_obj, task_id)
         if not ok:
@@ -1137,6 +1234,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 save_user_state(user_id, state)
                 context.user_data["view_scope"] = "day"
                 context.user_data["view_day"] = day
+                context.user_data["active_day"] = day
                 await query.answer()
                 await query.message.reply_text(
                     render_plan(day, day_obj),
@@ -1150,6 +1248,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             save_user_state(user_id, state)
             context.user_data["view_scope"] = "day"
             context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
             await query.answer()
             await query.message.reply_text(
                 f"✅ Добавил задачу на {format_date_ru(day)}: {pending_text}"
@@ -1194,6 +1293,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.pop("add_date", None)
             context.user_data.pop("del_mode", None)
             context.user_data.pop("awaiting_del_id", None)
+            context.user_data.pop("take_mode", None)
             await query.answer()
             await query.message.reply_text("Ок.")
             return
@@ -1212,15 +1312,106 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Задача не найдена в бэклоге.", show_alert=True)
             return
 
+        if context.user_data.get("take_mode"):
+            day = today_str()
+            day_obj = get_day(state, day)
+            if day_obj.get("closed"):
+                context.user_data.pop("take_mode", None)
+                await query.answer()
+                await query.message.reply_text(
+                    "Сегодня уже закрыт. Куда добавить задачу?",
+                    reply_markup=build_pick_to_keyboard(item_id),
+                )
+                return
+
+            day_obj = add_task_to_day(state, day, item.get("text"))
+            backlog.remove(item)
+            backlog[:] = normalize_task_ids_backlog(backlog)
+            state["backlog"] = backlog
+            save_user_state(user_id, state)
+            context.user_data.pop("take_mode", None)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
+            await query.answer("✅ Добавил в план на сегодня")
+            await query.message.reply_text(
+                render_plan(day, day_obj),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_today_keyboard(day_obj),
+            )
+            return
+
         context.user_data["move_task_id"] = item_id
         context.user_data.pop("move_mode", None)
         context.user_data.pop("add_mode", None)
         context.user_data.pop("add_date", None)
         context.user_data.pop("del_mode", None)
         context.user_data.pop("awaiting_del_id", None)
+        context.user_data.pop("take_mode", None)
         await query.answer()
         await query.message.reply_text("Куда перенести задачу?", reply_markup=build_move_keyboard(item_id))
         return
+
+    if data.startswith("pick_to:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await query.answer("Неверные данные.", show_alert=True)
+            return
+
+        try:
+            item_id = int(parts[2])
+        except ValueError:
+            await query.answer("Неверный номер задачи.", show_alert=True)
+            return
+
+        target = parts[1]
+        user_id = query.from_user.id
+        state = load_user_state(user_id)
+        backlog = get_backlog(state)
+        item = find_backlog_item(backlog, item_id)
+        if not item:
+            await query.answer("Задача не найдена в бэклоге.", show_alert=True)
+            return
+
+        if target == "tomorrow":
+            day = tomorrow_str()
+            day_obj = add_task_to_day(state, day, item.get("text"))
+            backlog.remove(item)
+            backlog[:] = normalize_task_ids_backlog(backlog)
+            state["backlog"] = backlog
+            save_user_state(user_id, state)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
+            await query.answer()
+            await query.message.reply_text(
+                f"✅ Добавил на {format_date_ru(day)}: {item.get('text')}"
+            )
+            await query.message.reply_text(render_day_preview(day, day_obj, include_text=item.get("text")))
+            return
+
+        if target == "reopen_today":
+            day = today_str()
+            day_obj = get_day(state, day)
+            day_obj["closed"] = False
+            day_obj.pop("closed_at", None)
+            if not day_obj.get("tasks"):
+                create_default_plan(day_obj)
+            day_obj = add_task_to_day(state, day, item.get("text"))
+            backlog.remove(item)
+            backlog[:] = normalize_task_ids_backlog(backlog)
+            state["backlog"] = backlog
+            save_user_state(user_id, state)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
+            await query.answer("✅ Добавил в план на сегодня")
+            await query.message.reply_text(
+                render_plan(day, day_obj),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_today_keyboard(day_obj),
+            )
+            return
 
     if data.startswith("move:"):
         parts = data.split(":")
@@ -1250,7 +1441,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.pop("awaiting_del_id", None)
             await query.answer()
             await query.message.reply_text(
-                "Введите дату в формате ДД.ММ.ГГГГ, например 08.02.2026",
+                "Введите дату в формате ДД.ММ.ГГГГ, например 05.02.2026",
                 reply_markup=build_cancel_keyboard(),
             )
             return
@@ -1282,6 +1473,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.pop("move_task_id", None)
         context.user_data["view_scope"] = "day"
         context.user_data["view_day"] = day
+        context.user_data["active_day"] = day
         await query.answer()
         if target == "today":
             await query.message.reply_text(
@@ -1358,6 +1550,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             backlog.remove(item)
             backlog[:] = normalize_task_ids_backlog(backlog)
             save_user_state(user_id, state)
+            context.user_data["view_scope"] = "day"
+            context.user_data["view_day"] = day
+            context.user_data["active_day"] = day
             await query.message.reply_text(
                 render_plan(day, day_obj),
                 parse_mode=ParseMode.HTML,
